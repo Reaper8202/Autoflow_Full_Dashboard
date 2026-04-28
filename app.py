@@ -1362,7 +1362,7 @@ def main():
     _sidebar()
 
     page = st.radio(
-        "", ["Sensor & Calibration", "Test Results", "Run Automated Test"],
+        "Page", ["Sensor & Calibration", "Test Results", "Run Automated Test"],
         horizontal=True, label_visibility="collapsed",
     )
 

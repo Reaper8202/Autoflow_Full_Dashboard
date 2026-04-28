@@ -12,6 +12,7 @@ Observed packet formats:
 from __future__ import annotations
 
 import asyncio
+import platform
 import struct
 import threading
 import time
@@ -213,7 +214,8 @@ class SensorLink:
             self._set_error("BLE requires the 'bleak' package")
             return False
 
-        address = token[len(BLE_PREFIX):].split("::", 1)[0]
+        payload = token[len(BLE_PREFIX):]
+        address, _, name_hint = payload.partition("::")
         self.port = address
         self.mode = "ble"
         self._ble_ready.clear()
@@ -223,8 +225,8 @@ class SensorLink:
         self._status = f"Connecting over BLE: {address}"
         self._ble_buffer = b""
         self._last_ble_time_s = None
-        self._start_reader_thread(lambda: self._run_ble_session(address))
-        self._ble_ready.wait(timeout=10.0)
+        self._start_reader_thread(lambda: self._run_ble_session(address, name_hint or None))
+        self._ble_ready.wait(timeout=15.0)
         if self._ble_connected:
             return True
         self.close()
@@ -339,11 +341,11 @@ class SensorLink:
                 self._set_error(f"Serial read error: {e}")
                 time.sleep(0.05)
 
-    def _run_ble_session(self, address):
+    def _run_ble_session(self, address, name_hint=None):
         self._ble_loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._ble_loop)
         try:
-            self._ble_loop.run_until_complete(self._ble_session(address))
+            self._ble_loop.run_until_complete(self._ble_session(address, name_hint=name_hint))
         except Exception as e:
             self._set_error(f"BLE session failed: {e}")
             self._ble_ready.set()
@@ -356,35 +358,19 @@ class SensorLink:
                 pass
             self._ble_loop.close()
 
-    async def _ble_session(self, address):
-        client = BleakClient(address)
+    async def _ble_session(self, address, name_hint=None):
+        device_or_address = address
+        if platform.system() == "Windows":
+            resolved = await self._resolve_ble_device(address, name_hint=name_hint)
+            if resolved is not None:
+                device_or_address = resolved
+
+        client = BleakClient(device_or_address)
         self._ble_client = client
         try:
-            await client.connect(timeout=10.0)
-            services = client.services
-            target_char = None
-            for service in services:
-                if service.uuid.lower() == XIAO_SERVICE_UUID:
-                    for char in service.characteristics:
-                        if char.uuid.lower() == XIAO_NOTIFY_UUID:
-                            target_char = char
-                            break
-                    if target_char is None:
-                        for char in service.characteristics:
-                            if "notify" in [p.lower() for p in char.properties]:
-                                target_char = char
-                                break
-                    break
-
-            if target_char is None:
-                for service in services:
-                    for char in service.characteristics:
-                        props = [p.lower() for p in char.properties]
-                        if "notify" in props or "indicate" in props:
-                            target_char = char
-                            break
-                    if target_char is not None:
-                        break
+            await client.connect(timeout=15.0)
+            services = await self._get_ble_services(client)
+            target_char = self._find_ble_notify_characteristic(services)
 
             if target_char is None:
                 raise RuntimeError("No BLE notify characteristic found")
@@ -409,6 +395,65 @@ class SensorLink:
         if self._ble_client is not None and self._ble_client.is_connected:
             await self._ble_client.disconnect()
         self._ble_connected = False
+
+    async def _resolve_ble_device(self, address, name_hint=None):
+        if BleakScanner is None:
+            return None
+        try:
+            devices = await BleakScanner.discover(timeout=8.0)
+        except Exception:
+            return None
+
+        address_lower = address.lower()
+        for device in devices:
+            dev_addr = getattr(device, "address", "") or ""
+            if dev_addr.lower() == address_lower:
+                return device
+
+        if name_hint:
+            for device in devices:
+                dev_name = getattr(device, "name", "") or ""
+                if dev_name and dev_name == name_hint:
+                    return device
+        return None
+
+    async def _get_ble_services(self, client):
+        services = getattr(client, "services", None)
+        if services:
+            return services
+
+        get_services = getattr(client, "get_services", None)
+        if callable(get_services):
+            services = await get_services()
+            if services:
+                return services
+
+        services = getattr(client, "services", None)
+        if services:
+            return services
+
+        raise RuntimeError("BLE service discovery failed")
+
+    def _find_ble_notify_characteristic(self, services):
+        target_char = None
+        for service in services:
+            if service.uuid.lower() == XIAO_SERVICE_UUID:
+                for char in service.characteristics:
+                    if char.uuid.lower() == XIAO_NOTIFY_UUID:
+                        return char
+                for char in service.characteristics:
+                    if "notify" in [p.lower() for p in char.properties]:
+                        target_char = char
+                        break
+                if target_char is not None:
+                    return target_char
+
+        for service in services:
+            for char in service.characteristics:
+                props = [p.lower() for p in char.properties]
+                if "notify" in props or "indicate" in props:
+                    return char
+        return None
 
     def _ble_notification_handler(self, _sender, data):
         if not data:
