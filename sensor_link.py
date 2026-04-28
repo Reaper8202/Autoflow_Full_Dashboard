@@ -12,6 +12,7 @@ Observed packet formats:
 from __future__ import annotations
 
 import asyncio
+import atexit
 import platform
 import struct
 import threading
@@ -163,9 +164,13 @@ class SensorLink:
         self._ble_client = None
         self._ble_connected = False
         self._ble_ready = threading.Event()
+        self._ble_first_packet = threading.Event()
+        self._ble_notify_uuid = None
         self._ble_buffer = b""
         self._serial_buffer = b""
         self._last_ble_time_s = None
+
+        atexit.register(self.close)
 
     # ── public status ──────────────────────────────────────────────────
 
@@ -219,16 +224,20 @@ class SensorLink:
         self.port = address
         self.mode = "ble"
         self._ble_ready.clear()
+        self._ble_first_packet.clear()
         self._ble_connected = False
         self._stop_event.clear()
         self._last_error = ""
         self._status = f"Connecting over BLE: {address}"
         self._ble_buffer = b""
+        self._ble_notify_uuid = None
         self._last_ble_time_s = None
         self._start_reader_thread(lambda: self._run_ble_session(address, name_hint or None))
         self._ble_ready.wait(timeout=15.0)
         if self._ble_connected:
-            return True
+            if self._ble_first_packet.wait(timeout=3.0):
+                return True
+            self._set_error("BLE connected but no sensor notifications arrived. Try reconnecting or power-cycling the sensor.")
         self.close()
         if not self._last_error:
             self._set_error("BLE connect timed out")
@@ -245,7 +254,7 @@ class SensorLink:
         if self._ble_loop and self._ble_client:
             try:
                 future = asyncio.run_coroutine_threadsafe(self._ble_disconnect(), self._ble_loop)
-                future.result(timeout=3.0)
+                future.result(timeout=5.0)
             except Exception:
                 pass
 
@@ -265,6 +274,8 @@ class SensorLink:
         self._ble_client = None
         self._ble_connected = False
         self._ble_ready.clear()
+        self._ble_first_packet.clear()
+        self._ble_notify_uuid = None
         self._reader_thread = None
         self._status = "Offline"
 
@@ -401,6 +412,7 @@ class SensorLink:
             services = await self._get_ble_services(client)
             target_char = self._find_ble_notify_characteristic(services)
 
+            self._ble_notify_uuid = target_char.uuid
             await client.start_notify(target_char.uuid, self._ble_notification_handler)
             self._ble_connected = True
             self._status = f"BLE connected: {address}"
@@ -411,16 +423,30 @@ class SensorLink:
                 await asyncio.sleep(0.05)
         finally:
             try:
+                if client.is_connected and self._ble_notify_uuid:
+                    try:
+                        await client.stop_notify(self._ble_notify_uuid)
+                    except Exception:
+                        pass
                 if client.is_connected:
                     await client.disconnect()
             except Exception:
                 pass
             self._ble_connected = False
+            self._ble_notify_uuid = None
+            self._ble_first_packet.clear()
 
     async def _ble_disconnect(self):
         if self._ble_client is not None and self._ble_client.is_connected:
+            if self._ble_notify_uuid:
+                try:
+                    await self._ble_client.stop_notify(self._ble_notify_uuid)
+                except Exception:
+                    pass
             await self._ble_client.disconnect()
         self._ble_connected = False
+        self._ble_notify_uuid = None
+        self._ble_first_packet.clear()
 
     async def _resolve_ble_device(self, address, name_hint=None):
         if BleakScanner is None:
@@ -497,6 +523,7 @@ class SensorLink:
         if not data:
             return
 
+        self._ble_first_packet.set()
         payload = bytes(data)
 
         # Text mode notifications, e.g. "[timestamp_ms, raw_value]\n"
