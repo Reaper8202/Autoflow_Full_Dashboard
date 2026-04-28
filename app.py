@@ -951,9 +951,12 @@ def page_run():
         st.info("Cleared saved run results")
 
     if abort_btn and link.is_open():
-        link.send("abort")
-        link.send("stop")
-        st.warning("Abort sent")
+        stopped = link.hard_stop("manual abort button")
+        st.session_state["run_analysis_status"] = "Idle"
+        if stopped:
+            st.warning("Abort/stop sequence sent")
+        else:
+            st.error("Abort failed to send")
 
     if run_btn:
         if mode == "Exact playback":
@@ -1038,8 +1041,7 @@ def _run_exact(link, t, q, cal_factor, speed_mult):
             time.sleep(control_dt)
     finally:
         if link.is_open():
-            link.write_line("0")
-            link.write_line("stop")
+            link.hard_stop("exact playback complete")
         # Stop sensor collection
         if sensor.is_open():
             sensor.stop_collecting()
@@ -1083,9 +1085,10 @@ def _run_template(link, shape, qmax, volume, duration):
     if sensor.is_open():
         sensor.start_collecting()
 
-    if link.is_open():
-        link.ser.write(b"run\r\n")
-        link._log("tx", "run")
+    if link.is_open() and not link.write_line("run"):
+        st.error("Failed to send run command to pump")
+        st.session_state["run_analysis_status"] = "Idle"
+        return
 
     progress = st.progress(0.0, text="Running...")
     chart_slot = st.empty()
@@ -1119,6 +1122,8 @@ def _run_template(link, shape, qmax, volume, duration):
                 break
             time.sleep(0.2)
     finally:
+        if link.is_open():
+            link.hard_stop("template run finalize")
         # Stop sensor collection
         if sensor.is_open():
             sensor.stop_collecting()

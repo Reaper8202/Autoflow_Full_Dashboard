@@ -20,13 +20,14 @@ class PumpLink:
         self.ser = None
         self.port = None
         self.log = []
+        self.last_stop_reason = None
 
     # -- connection ----------------------------------------------------------
 
     def connect(self, port, baud=115200):
         self.close()
         try:
-            self.ser = serial.Serial(port, baud, timeout=0.5)
+            self.ser = serial.Serial(port, baud, timeout=0.5, write_timeout=0.5)
             time.sleep(1.5)
             self.port = port
             self._flush()
@@ -52,28 +53,49 @@ class PumpLink:
     # -- I/O -----------------------------------------------------------------
 
     def send(self, cmd, wait_reply_s=0.12):
-        if not self.is_open():
-            self._log("err", "not connected")
-            return ""
-        try:
-            self.ser.write((cmd + "\r\n").encode())
-            self._log("tx", cmd)
-        except Exception as e:
-            self._log("err", f"write failed: {e}")
+        if not self.write_line(cmd):
             return ""
         time.sleep(wait_reply_s)
         return self._read_all()
 
     def write_line(self, line):
         if not self.is_open():
+            self._log("err", "not connected")
             return False
         try:
-            self.ser.write((line + "\r\n").encode())
+            payload = (line + "\r\n").encode()
+            self.ser.write(payload)
+            self.ser.flush()
             self._log("tx", line)
             return True
         except Exception as e:
             self._log("err", f"write failed: {e}")
             return False
+
+    def hard_stop(self, reason=""):
+        """Best-effort repeated stop sequence, mainly for flaky Windows serial links."""
+        if not self.is_open():
+            self._log("err", "hard_stop requested while not connected")
+            return False
+
+        self.last_stop_reason = reason or "unspecified"
+        self._log("sys", f"hard_stop start reason={self.last_stop_reason}")
+
+        ok = False
+        sequence = ["0", "stop", "abort", "0", "stop"]
+        for cmd in sequence:
+            wrote = self.write_line(cmd)
+            ok = ok or wrote
+            time.sleep(0.08)
+            self.drain()
+
+        try:
+            self.ser.flush()
+        except Exception:
+            pass
+
+        self._log("sys", f"hard_stop end reason={self.last_stop_reason}")
+        return ok
 
     def drain(self):
         if not self.is_open():
