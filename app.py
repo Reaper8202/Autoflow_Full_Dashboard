@@ -1005,7 +1005,13 @@ def _run_exact(link, t, q, cal_factor, speed_mult):
     duration = float(t[-1])
     expected_volume_ml = float(np.trapezoid(q, t)) if len(t) > 1 else 0.0
     playback_duration = duration / max(speed_mult, 1e-6)
-    control_dt = min(0.05, max(0.01, playback_duration / 1000.0))
+
+    # Do not flood the firmware with exact-playback RPM writes.
+    # The Feather controller applies each incoming RPM command via a real Modbus
+    # transaction, so trying to stream updates every 10 to 25 ms creates a serial
+    # backlog. That backlog makes the pump keep executing stale high-RPM commands
+    # long after the source curve has started descending.
+    control_dt = max(0.10, min(0.25, playback_duration / 250.0))
 
     cmd_t, cmd_q, cmd_rpm = [], [], []
     last_rpm = None
@@ -1043,7 +1049,10 @@ def _run_exact(link, t, q, cal_factor, speed_mult):
             cmd_rpm.append(rpm)
 
             frac = min(1.0, src_elapsed / max(duration, 1e-6))
-            progress.progress(frac, text=f"{src_elapsed:.1f}/{duration:.1f}s  flow={flow:.2f} mL/s  rpm={rpm:.0f}")
+            progress.progress(
+                frac,
+                text=f"{src_elapsed:.1f}/{duration:.1f}s  flow={flow:.2f} mL/s  rpm={rpm:.0f}  cmd_dt={control_dt:.2f}s",
+            )
 
             if src_elapsed >= duration:
                 break
