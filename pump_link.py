@@ -72,6 +72,32 @@ class PumpLink:
             self._log("err", f"write failed: {e}")
             return False
 
+    def write_realtime_line(self, line):
+        """Best-effort latest-value write for host-streamed control.
+
+        On some Windows serial stacks, rapidly streaming RPM updates can leave a
+        queue of stale commands in the host/output buffers. For exact playback,
+        that is the wrong behavior: we care about the newest setpoint, not every
+        intermediate one. So before writing the next realtime RPM command, drop
+        any unsent buffered output and send only the freshest value.
+        """
+        if not self.is_open():
+            self._log("err", "not connected")
+            return False
+        try:
+            try:
+                self.ser.reset_output_buffer()
+            except Exception:
+                pass
+            payload = (line + "\r\n").encode()
+            self.ser.write(payload)
+            self.ser.flush()
+            self._log("tx", f"realtime:{line}")
+            return True
+        except Exception as e:
+            self._log("err", f"realtime write failed: {e}")
+            return False
+
     def hard_stop(self, reason=""):
         """Best-effort repeated stop sequence, mainly for flaky Windows serial links."""
         if not self.is_open():
@@ -161,6 +187,15 @@ class PumpLink:
             if line.strip():
                 self._log("rx", line)
         return reply
+
+    def clear_log(self):
+        self.log = []
+
+    def snapshot_log(self):
+        return list(self.log)
+
+    def export_log_text(self):
+        return "\n".join(f"[{ts}] {direction.upper():>3} {text}" for ts, direction, text in self.log)
 
     def _log(self, direction, text):
         self.log.append((time.strftime("%H:%M:%S"), direction, text))

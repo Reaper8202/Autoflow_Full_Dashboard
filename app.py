@@ -90,6 +90,8 @@ def _init():
         st.session_state.last_run_pdf = None
     if "last_run_pdf_for" not in st.session_state:
         st.session_state.last_run_pdf_for = None
+    if "last_pump_log" not in st.session_state:
+        st.session_state.last_pump_log = None
 
 
 # ── sidebar ────────────────────────────────────────────────────────────────
@@ -947,11 +949,13 @@ def page_run():
 
     if clear_results_btn:
         st.session_state["last_run_analysis"] = None
+        st.session_state["last_pump_log"] = None
         st.session_state["run_analysis_status"] = "Idle"
         st.info("Cleared saved run results")
 
     if abort_btn and link.is_open():
         stopped = link.hard_stop("manual abort button")
+        _store_pump_debug_log(link)
         st.session_state["run_analysis_status"] = "Idle"
         if stopped:
             st.warning("Abort/stop sequence sent")
@@ -975,6 +979,10 @@ def page_run():
         st.caption("These are the most recently captured sensor-analysis graphs from the automated test page.")
         _render_saved_run_analysis(saved_results)
 
+    pump_log = st.session_state.get("last_pump_log")
+    if pump_log:
+        _render_pump_debug_log(pump_log)
+
 
 def _run_exact(link, t, q, cal_factor, speed_mult):
     """Stream the source curve point by point to the pump, with simultaneous sensor collection."""
@@ -987,6 +995,8 @@ def _run_exact(link, t, q, cal_factor, speed_mult):
     st.session_state["last_run_analysis"] = None
     st.session_state["last_run_pdf"] = None
     st.session_state["last_run_pdf_for"] = None
+    st.session_state["last_pump_log"] = None
+    link.clear_log()
     sensor = st.session_state.sensor
     progress = st.progress(0.0, text="Streaming...")
     chart_slot = st.empty()
@@ -1009,9 +1019,9 @@ def _run_exact(link, t, q, cal_factor, speed_mult):
     # Do not flood the firmware with exact-playback RPM writes.
     # The Feather controller applies each incoming RPM command via a real Modbus
     # transaction, so trying to stream updates every 10 to 25 ms creates a serial
-    # backlog. That backlog makes the pump keep executing stale high-RPM commands
-    # long after the source curve has started descending.
-    control_dt = max(0.10, min(0.25, playback_duration / 250.0))
+    # backlog. That backlog makes the pump keep executing stale commands long
+    # after the source curve has changed. Be conservative here.
+    control_dt = max(0.20, min(0.35, playback_duration / 180.0))
 
     cmd_t, cmd_q, cmd_rpm = [], [], []
     last_rpm = None
@@ -1034,7 +1044,7 @@ def _run_exact(link, t, q, cal_factor, speed_mult):
                 rpm = 0.0
 
             if last_rpm is None or abs(rpm - last_rpm) >= RPM_WRITE_EPSILON:
-                sent = link.write_line("0" if rpm <= 0 else f"{rpm:.3f}")
+                sent = link.write_realtime_line("0" if rpm <= 0 else f"{rpm:.3f}")
                 if not sent:
                     status.error("Pump serial write failed during playback")
                     break
@@ -1066,6 +1076,7 @@ def _run_exact(link, t, q, cal_factor, speed_mult):
         progress.empty()
 
     link.drain()
+    _store_pump_debug_log(link)
     status.success(f"Playback complete ({playback_duration:.1f}s wall time)")
     st.session_state["run_analysis_status"] = "Collecting and analyzing sensor data..."
 
@@ -1094,6 +1105,8 @@ def _run_template(link, shape, qmax, volume, duration):
     st.session_state["last_run_analysis"] = None
     st.session_state["last_run_pdf"] = None
     st.session_state["last_run_pdf_for"] = None
+    st.session_state["last_pump_log"] = None
+    link.clear_log()
     sensor = st.session_state.sensor
     link.send(f"shape {shape}")
     link.send(f"qmax {qmax}")
@@ -1147,6 +1160,7 @@ def _run_template(link, shape, qmax, volume, duration):
         if sensor.is_open():
             sensor.stop_collecting()
 
+    _store_pump_debug_log(link)
     progress.empty()
     st.session_state["run_analysis_status"] = "Collecting and analyzing sensor data..."
 
@@ -1178,6 +1192,40 @@ def _parse_telemetry(line):
                 pass
         i += 1
     return vals
+
+
+def _store_pump_debug_log(link):
+    st.session_state["last_pump_log"] = link.snapshot_log()
+
+
+def _render_pump_debug_log(log_rows):
+    if not log_rows:
+        return
+
+    tx_count = sum(1 for _, direction, _ in log_rows if direction == "tx")
+    rx_count = sum(1 for _, direction, _ in log_rows if direction == "rx")
+    err_count = sum(1 for _, direction, _ in log_rows if direction == "err")
+    sys_count = sum(1 for _, direction, _ in log_rows if direction == "sys")
+
+    st.divider()
+    st.subheader("Pump Debug Log")
+    dbg_cols = st.columns(4)
+    dbg_cols[0].metric("Entries", len(log_rows))
+    dbg_cols[1].metric("TX", tx_count)
+    dbg_cols[2].metric("RX", rx_count)
+    dbg_cols[3].metric("ERR/SYS", err_count + sys_count)
+
+    log_text = "\n".join(f"[{ts}] {direction.upper():>3} {text}" for ts, direction, text in log_rows)
+    log_key = f"{len(log_rows)}_{log_rows[-1][0].replace(':', '-') if log_rows else 'empty'}"
+    st.download_button(
+        "Download pump debug log",
+        data=log_text.encode(),
+        file_name=f"pump_debug_{log_key}.log",
+        mime="text/plain",
+        key=f"download_pump_debug_{log_key}",
+    )
+    with st.expander("Show pump TX/RX log", expanded=False):
+        st.code(log_text or "(empty)", language="text")
 
 
 def _build_run_analysis_figures(results):
