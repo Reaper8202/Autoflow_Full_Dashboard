@@ -237,9 +237,8 @@ class SensorLink:
         self._start_reader_thread(lambda: self._run_ble_session(address, name_hint or None))
         self._ble_ready.wait(timeout=15.0)
         if self._ble_connected:
-            if self._ble_first_packet.wait(timeout=3.0):
-                return True
-            self._set_error("BLE connected but no sensor notifications arrived. Try reconnecting or power-cycling the sensor.")
+            self._status = f"BLE connected, waiting for data: {address}"
+            return True
         self.close()
         if not self._last_error:
             self._set_error("BLE connect timed out")
@@ -417,7 +416,7 @@ class SensorLink:
             self._ble_notify_uuid = target_char.uuid
             await client.start_notify(target_char.uuid, self._ble_notification_handler)
             self._ble_connected = True
-            self._status = f"BLE connected: {address}"
+            self._status = f"BLE connected, waiting for data: {address}"
             self._last_error = ""
             self._ble_ready.set()
 
@@ -526,6 +525,8 @@ class SensorLink:
             return
 
         self._ble_first_packet.set()
+        if self.port:
+            self._status = f"BLE streaming: {self.port}"
         payload = bytes(data)
         if self._ble_debug_count < 25:
             print(f"BLE notify[{self._ble_debug_count}] len={len(payload)} data={payload!r}")
