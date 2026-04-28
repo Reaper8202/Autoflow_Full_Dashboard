@@ -1003,11 +1003,13 @@ def _run_exact(link, t, q, cal_factor, speed_mult):
         return
 
     duration = float(t[-1])
+    expected_volume_ml = float(np.trapezoid(q, t)) if len(t) > 1 else 0.0
     playback_duration = duration / max(speed_mult, 1e-6)
     control_dt = min(0.05, max(0.01, playback_duration / 1000.0))
 
     cmd_t, cmd_q, cmd_rpm = [], [], []
     last_rpm = None
+    last_serial_drain = 0.0
     link.drain()
 
     # Start sensor collection
@@ -1026,8 +1028,15 @@ def _run_exact(link, t, q, cal_factor, speed_mult):
                 rpm = 0.0
 
             if last_rpm is None or abs(rpm - last_rpm) >= RPM_WRITE_EPSILON:
-                link.write_line("0" if rpm <= 0 else f"{rpm:.3f}")
+                sent = link.write_line("0" if rpm <= 0 else f"{rpm:.3f}")
+                if not sent:
+                    status.error("Pump serial write failed during playback")
+                    break
                 last_rpm = rpm
+
+            if elapsed - last_serial_drain >= 0.1:
+                link.drain()
+                last_serial_drain = elapsed
 
             cmd_t.append(src_elapsed)
             cmd_q.append(flow if rpm > 0 else 0.0)
@@ -1047,6 +1056,7 @@ def _run_exact(link, t, q, cal_factor, speed_mult):
             sensor.stop_collecting()
         progress.empty()
 
+    link.drain()
     status.success(f"Playback complete ({playback_duration:.1f}s wall time)")
     st.session_state["run_analysis_status"] = "Collecting and analyzing sensor data..."
 
@@ -1061,7 +1071,7 @@ def _run_exact(link, t, q, cal_factor, speed_mult):
         st.download_button("Download log CSV", csv, file_name=f"playback_{int(time.time())}.csv")
 
     # Analyze collected sensor data
-    _display_sensor_analysis()
+    _display_sensor_analysis(expected_volume_ml=expected_volume_ml)
 
 
 def _run_template(link, shape, qmax, volume, duration):
@@ -1142,7 +1152,7 @@ def _run_template(link, shape, qmax, volume, duration):
         st.download_button("Download log CSV", csv, file_name=f"run_{int(time.time())}.csv")
 
     # Analyze collected sensor data
-    _display_sensor_analysis()
+    _display_sensor_analysis(expected_volume_ml=float(volume))
 
 
 def _parse_telemetry(line):
@@ -1266,13 +1276,32 @@ def _render_saved_run_analysis(results):
     draining = results["draining"]
     roi = results.get("roi", [0, max(0, len(t_arr) - 1)])
 
-    cols = st.columns(4)
     duration = t_arr[-1] - t_arr[0] if len(t_arr) > 1 else 0
+    total_vol_g = float(cum_volume[-1]) if len(cum_volume) > 0 else 0.0
+    measured_volume_ml = float(results.get("measured_volume_ml", total_vol_g / 0.9982 if total_vol_g else 0.0))
+    expected_volume_ml = results.get("expected_volume_ml")
+    raw_difference_ml = results.get("raw_difference_ml")
+    percent_difference = results.get("percent_difference")
+
+    cols = st.columns(4)
     cols[0].metric("Duration", f"{duration:.1f} s")
     cols[1].metric("Peak Flow", f"{np.max(kz_flow):.2f} g/s" if len(kz_flow) else "0.00 g/s")
-    total_vol = cum_volume[-1] if len(cum_volume) > 0 else 0
-    cols[2].metric("Total Volume", f"{total_vol:.1f} g ({total_vol / 0.9982:.0f} mL)")
+    cols[2].metric("Measured Volume", f"{total_vol_g:.1f} g ({measured_volume_ml:.1f} mL)")
     cols[3].metric("Zones", f"V:{len(voiding)} D:{len(draining)} E:{len(empty)}")
+
+    if expected_volume_ml is not None:
+        err_cols = st.columns(3)
+        err_cols[0].metric("Expected Volume", f"{float(expected_volume_ml):.1f} mL")
+        err_cols[1].metric(
+            "Raw Difference",
+            f"{float(raw_difference_ml):+.1f} mL" if raw_difference_ml is not None else "n/a",
+            help="Measured sensor volume minus expected CSV/template volume.",
+        )
+        err_cols[2].metric(
+            "Percent Difference",
+            f"{float(percent_difference):+.2f}%" if percent_difference is not None else "n/a",
+            help="(Measured - expected) / expected * 100",
+        )
 
     saved_at = int(results.get("saved_at", 0))
     if st.session_state.get("last_run_pdf_for") != saved_at:
@@ -1313,7 +1342,7 @@ def _render_saved_run_analysis(results):
     )
 
 
-def _display_sensor_analysis():
+def _display_sensor_analysis(expected_volume_ml=None):
     """Analyze and display collected sensor data after pump run."""
     sensor = st.session_state.sensor
     t_data, m_data, _ = sensor.get_data()
@@ -1331,6 +1360,17 @@ def _display_sensor_analysis():
     m_arr = np.asarray(m_data, dtype=float)
     filt_mass, filt_inflow, kz_flow, cum_volume, empty, voiding, draining, roi = compute_flow_from_mass(t_arr, m_arr, cal_map)
 
+    measured_volume_g = float(cum_volume[-1]) if len(cum_volume) > 0 else 0.0
+    measured_volume_ml = measured_volume_g / 0.9982 if measured_volume_g else 0.0
+
+    raw_difference_ml = None
+    percent_difference = None
+    if expected_volume_ml is not None:
+        expected_volume_ml = float(expected_volume_ml)
+        raw_difference_ml = measured_volume_ml - expected_volume_ml
+        if abs(expected_volume_ml) > 1e-9:
+            percent_difference = (raw_difference_ml / expected_volume_ml) * 100.0
+
     st.session_state["last_run_pdf"] = None
     st.session_state["last_run_pdf_for"] = None
     st.session_state["last_run_analysis"] = {
@@ -1345,6 +1385,11 @@ def _display_sensor_analysis():
         "voiding": voiding,
         "draining": draining,
         "roi": roi,
+        "expected_volume_ml": expected_volume_ml,
+        "measured_volume_g": measured_volume_g,
+        "measured_volume_ml": measured_volume_ml,
+        "raw_difference_ml": raw_difference_ml,
+        "percent_difference": percent_difference,
         "saved_at": time.time(),
     }
     st.session_state["run_analysis_status"] = "Graphs ready"
