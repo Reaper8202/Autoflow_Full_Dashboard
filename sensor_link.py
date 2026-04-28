@@ -319,6 +319,16 @@ class SensorLink:
             self._masses.clear()
             self._raw_values.clear()
             self._time_offset = None
+
+        if self.mode == "ble" and self._ble_loop and self._ble_client and self._ble_connected:
+            self._ble_first_packet.clear()
+            self._status = f"BLE connected, refreshing stream: {self.port}"
+            try:
+                future = asyncio.run_coroutine_threadsafe(self._ble_restart_notify(), self._ble_loop)
+                future.result(timeout=5.0)
+            except Exception as e:
+                self._set_error(f"BLE stream refresh failed: {e}")
+
         self._collecting = True
 
     def stop_collecting(self):
@@ -449,6 +459,19 @@ class SensorLink:
         self._ble_notify_uuid = None
         self._ble_first_packet.clear()
 
+    async def _ble_restart_notify(self):
+        if self._ble_client is None or not self._ble_client.is_connected or not self._ble_notify_uuid:
+            return
+
+        try:
+            await self._ble_client.stop_notify(self._ble_notify_uuid)
+        except Exception:
+            pass
+
+        await asyncio.sleep(0.15)
+        await self._ble_client.start_notify(self._ble_notify_uuid, self._ble_notification_handler)
+        self._status = f"BLE connected, waiting for data: {self.port}"
+
     async def _resolve_ble_device(self, address, name_hint=None):
         if BleakScanner is None:
             return None
@@ -530,6 +553,8 @@ class SensorLink:
         payload = bytes(data)
         if self._ble_debug_count < 25:
             print(f"BLE notify[{self._ble_debug_count}] len={len(payload)} data={payload!r}")
+        if self._ble_debug_count == 0:
+            print("BLE stream is delivering sensor packets")
         self._ble_debug_count += 1
 
         # Text mode notifications, e.g. "[timestamp_ms, raw_value]\n"
