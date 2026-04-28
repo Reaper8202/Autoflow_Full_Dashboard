@@ -342,21 +342,50 @@ class SensorLink:
                 time.sleep(0.05)
 
     def _run_ble_session(self, address, name_hint=None):
-        self._ble_loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self._ble_loop)
+        loop = asyncio.new_event_loop()
+        self._ble_loop = loop
         try:
-            self._ble_loop.run_until_complete(self._ble_session(address, name_hint=name_hint))
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(self._ble_session(address, name_hint=name_hint))
+        except asyncio.CancelledError:
+            self._ble_ready.set()
         except Exception as e:
             self._set_error(f"BLE session failed: {e}")
             self._ble_ready.set()
         finally:
             try:
-                pending = asyncio.all_tasks(self._ble_loop)
-                for task in pending:
-                    task.cancel()
+                pending = [task for task in asyncio.all_tasks(loop) if not task.done()]
             except Exception:
-                pass
-            self._ble_loop.close()
+                pending = []
+
+            for task in pending:
+                task.cancel()
+
+            if pending and not loop.is_closed():
+                try:
+                    loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                except Exception:
+                    pass
+
+            if not loop.is_closed():
+                try:
+                    loop.run_until_complete(loop.shutdown_asyncgens())
+                except Exception:
+                    pass
+                try:
+                    loop.run_until_complete(loop.shutdown_default_executor())
+                except Exception:
+                    pass
+                try:
+                    asyncio.set_event_loop(None)
+                except Exception:
+                    pass
+                try:
+                    loop.close()
+                except Exception:
+                    pass
+
+            self._ble_loop = None
 
     async def _ble_session(self, address, name_hint=None):
         device_or_address = address
