@@ -401,9 +401,6 @@ class SensorLink:
             services = await self._get_ble_services(client)
             target_char = self._find_ble_notify_characteristic(services)
 
-            if target_char is None:
-                raise RuntimeError("No BLE notify characteristic found")
-
             await client.start_notify(target_char.uuid, self._ble_notification_handler)
             self._ble_connected = True
             self._status = f"BLE connected: {address}"
@@ -465,24 +462,36 @@ class SensorLink:
 
     def _find_ble_notify_characteristic(self, services):
         target_char = None
-        for service in services:
-            if service.uuid.lower() == XIAO_SERVICE_UUID:
-                for char in service.characteristics:
-                    if char.uuid.lower() == XIAO_NOTIFY_UUID:
-                        return char
-                for char in service.characteristics:
-                    if "notify" in [p.lower() for p in char.properties]:
-                        target_char = char
-                        break
-                if target_char is not None:
-                    return target_char
+        saw_expected_service = False
 
         for service in services:
+            service_uuid = (service.uuid or "").lower()
+            if service_uuid != XIAO_SERVICE_UUID:
+                continue
+
+            saw_expected_service = True
+            for char in service.characteristics:
+                if (char.uuid or "").lower() == XIAO_NOTIFY_UUID:
+                    return char
+
             for char in service.characteristics:
                 props = [p.lower() for p in char.properties]
-                if "notify" in props or "indicate" in props:
-                    return char
-        return None
+                if "notify" in props:
+                    target_char = char
+                    break
+
+            if target_char is not None:
+                return target_char
+
+        if not saw_expected_service:
+            raise RuntimeError(
+                f"Expected AutoFlow BLE service {XIAO_SERVICE_UUID} not found. "
+                "This is probably the wrong BLE device."
+            )
+
+        raise RuntimeError(
+            f"Expected AutoFlow notify characteristic {XIAO_NOTIFY_UUID} not found in service {XIAO_SERVICE_UUID}."
+        )
 
     def _ble_notification_handler(self, _sender, data):
         if not data:
