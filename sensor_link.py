@@ -169,6 +169,7 @@ class SensorLink:
         self._ble_buffer = b""
         self._serial_buffer = b""
         self._last_ble_time_s = None
+        self._ble_debug_count = 0
 
         atexit.register(self.close)
 
@@ -232,6 +233,7 @@ class SensorLink:
         self._ble_buffer = b""
         self._ble_notify_uuid = None
         self._last_ble_time_s = None
+        self._ble_debug_count = 0
         self._start_reader_thread(lambda: self._run_ble_session(address, name_hint or None))
         self._ble_ready.wait(timeout=15.0)
         if self._ble_connected:
@@ -525,6 +527,9 @@ class SensorLink:
 
         self._ble_first_packet.set()
         payload = bytes(data)
+        if self._ble_debug_count < 25:
+            print(f"BLE notify[{self._ble_debug_count}] len={len(payload)} data={payload!r}")
+        self._ble_debug_count += 1
 
         # Text mode notifications, e.g. "[timestamp_ms, raw_value]\n"
         if b"\n" in payload or payload.startswith(b"["):
