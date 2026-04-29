@@ -73,22 +73,24 @@ class PumpLink:
             return False
 
     def write_realtime_line(self, line):
-        """Best-effort latest-value write for host-streamed control.
+        """Streamed-control write.
 
-        On some Windows serial stacks, rapidly streaming RPM updates can leave a
-        queue of stale commands in the host/output buffers. For exact playback,
-        that is the wrong behavior: we care about the newest setpoint, not every
-        intermediate one. So before writing the next realtime RPM command, drop
-        any unsent buffered output and send only the freshest value.
+        Earlier versions of this method called ``reset_output_buffer()`` before
+        every send to "drop stale commands." That was actively harmful: on
+        Windows it issues ``PurgeComm(PURGE_TXABORT | PURGE_TXCLEAR)`` and on
+        macOS ``tcflush(fd, TCOFLUSH)``. Both can abort writes that are already
+        in flight to the USB CDC endpoint, so the previous RPM update gets
+        killed before the firmware ever sees it. That is exactly what made the
+        pump stick at stale RPMs (~348/384) during exact playback.
+
+        Commands are ~9 bytes and the host sends ~5 per second. The firmware
+        processes them in order and the last one wins, so we just need to let
+        the bytes through.
         """
         if not self.is_open():
             self._log("err", "not connected")
             return False
         try:
-            try:
-                self.ser.reset_output_buffer()
-            except Exception:
-                pass
             payload = (line + "\r\n").encode()
             self.ser.write(payload)
             self.ser.flush()

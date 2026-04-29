@@ -13,6 +13,7 @@ import os
 import io
 import json
 import time
+import base64
 from pathlib import Path
 
 import numpy as np
@@ -35,11 +36,10 @@ from analysis import (
     compute_flow_from_mass, kz_filter,
 )
 
-# ── config persistence ─────────────────────────────────────────────────────
-
 CONFIG_PATH = Path.home() / ".autoflow_dashboard_config.json"
 DEFAULT_CONFIG = {
     "cal_factor": 0.030,
+    "pump_max_rpm": 350.0,
     "last_com_port": "",
     "last_sensor_port": "",
     "sensor_cal_factor": DEFAULT_CALIBRATION_FACTOR,
@@ -73,6 +73,16 @@ def _save_cfg(cfg):
 def _init():
     if "cfg" not in st.session_state:
         st.session_state.cfg = _load_cfg()
+    else:
+        # Patch in any new DEFAULT_CONFIG keys that were added after this session started
+        cfg = st.session_state.cfg
+        changed = False
+        for k, v in DEFAULT_CONFIG.items():
+            if k not in cfg:
+                cfg[k] = v
+                changed = True
+        if changed:
+            _save_cfg(cfg)
     if "link" not in st.session_state:
         st.session_state.link = PumpLink()
     if "sensor" not in st.session_state:
@@ -90,8 +100,6 @@ def _init():
         st.session_state.last_run_pdf = None
     if "last_run_pdf_for" not in st.session_state:
         st.session_state.last_run_pdf_for = None
-    if "last_pump_log" not in st.session_state:
-        st.session_state.last_pump_log = None
 
 
 # ── sidebar ────────────────────────────────────────────────────────────────
@@ -178,6 +186,14 @@ def _sidebar():
         s_status = "green" if sensor.is_open() else "red"
         s_text = sensor.status_text if sensor.is_open() else "Offline"
         st.markdown(f"Sensor: :{s_status}[**{s_text}**]")
+        if sensor.is_open():
+            age = sensor.last_packet_age
+            if age is None:
+                st.caption("Stream: no packets yet")
+            elif age < 2.0:
+                st.caption(f"Stream: :green[live] ({age:.1f}s)")
+            else:
+                st.caption(f"Stream: :red[stale — {age:.1f}s since last packet]")
         if sensor.last_error and not sensor.is_open():
             st.caption(f"Last error: {sensor.last_error}")
 
@@ -219,6 +235,14 @@ def _sidebar():
         )
         if new_k != cfg["cal_factor"]:
             cfg["cal_factor"] = float(new_k)
+            _save_cfg(cfg)
+
+        new_max_rpm = st.number_input(
+            "Pump max RPM (hardware cap)", value=float(cfg.get("pump_max_rpm", 350.0)),
+            min_value=1.0, max_value=float(PUMP_MAX_RPM), format="%.0f", step=10.0,
+        )
+        if new_max_rpm != cfg.get("pump_max_rpm"):
+            cfg["pump_max_rpm"] = float(new_max_rpm)
             _save_cfg(cfg)
 
         new_sf = st.number_input(
@@ -843,8 +867,6 @@ def page_run():
 
     if not link.is_open():
         st.warning("Connect to the pump in the sidebar first.")
-    if not sensor.is_open():
-        st.warning("Sensor is not connected. The pump can still run, but no post-run flow/mass analysis graphs will be produced.")
 
     # ── input: CSV or template ─────────────────────────────────────────
     source = st.radio("Input source", ["Upload CSV curve", "Use template"], horizontal=True)
@@ -904,6 +926,10 @@ def page_run():
     playback_duration = source_duration / max(speed, 1e-6)
     peak_rpm = source_qmax / cfg["cal_factor"] if cfg["cal_factor"] > 0 else 0
 
+    # Effective RPM ceiling = the lower of the firmware hard-stop and the
+    # user-configured hardware cap (e.g. pump motor limited to 350 RPM).
+    effective_max_rpm = min(float(cfg.get("pump_max_rpm", PUMP_MAX_RPM)), float(PUMP_MAX_RPM))
+
     # Stats
     cols = st.columns(4)
     cols[0].metric("Duration", f"{playback_duration:.1f} s")
@@ -911,19 +937,39 @@ def page_run():
     cols[2].metric("Volume", f"{source_volume:.0f} mL")
     cols[3].metric("Peak RPM", f"{peak_rpm:.0f}")
 
-    # Warnings
+    # Auto-scale the profile if peak RPM exceeds hardware cap (preserves shape)
+    profile_scale = 1.0
+    if peak_rpm > effective_max_rpm + 1e-6 and peak_rpm > 0:
+        profile_scale = effective_max_rpm / peak_rpm
+
+    scaled_q = source_q * profile_scale
+    scaled_qmax = source_qmax * profile_scale
+    scaled_peak_rpm = peak_rpm * profile_scale
+
+    # Warnings / gate checks
     run_disabled = not link.is_open()
-    if peak_rpm > PUMP_MAX_RPM:
-        st.error(f"Peak RPM ({peak_rpm:.0f}) exceeds max ({PUMP_MAX_RPM:.0f}). Reduce flow or adjust cal_factor.")
+    if not sensor.is_open():
+        st.error("Sensor is not connected. Connect the sensor in the sidebar before starting a test.")
         run_disabled = True
-    elif 0 < peak_rpm < MIN_RPM_THRESHOLD:
-        st.error(f"Peak RPM ({peak_rpm:.1f}) below minimum ({MIN_RPM_THRESHOLD}). Increase flow or adjust cal_factor.")
+    if profile_scale < 1.0 - 1e-6:
+        effective_volume = float(np.trapezoid(scaled_q, source_t))
+        st.warning(
+            f"Profile peak ({peak_rpm:.0f} RPM) exceeds pump cap ({effective_max_rpm:.0f} RPM). "
+            f"Auto-scaling to {profile_scale:.0%} — peak flow {scaled_qmax:.2f} mL/s, "
+            f"effective volume {effective_volume:.0f} mL. Shape is preserved."
+        )
+    elif 0 < scaled_peak_rpm < MIN_RPM_THRESHOLD:
+        st.error(f"Peak RPM ({scaled_peak_rpm:.1f}) below minimum ({MIN_RPM_THRESHOLD}). Increase flow or adjust cal_factor.")
         run_disabled = True
 
-    # Preview chart
+    # Preview chart — show scaled profile so user sees what will actually run
     fig = go.Figure()
     preview_t = (source_t - source_t[0]) / max(speed, 1e-6) if speed != 1.0 else source_t - source_t[0]
-    fig.add_trace(go.Scatter(x=preview_t, y=source_q, name="Planned output", line=dict(color="#E91E63", width=2)))
+    if profile_scale < 1.0 - 1e-6:
+        fig.add_trace(go.Scatter(x=preview_t, y=source_q, name="Original", line=dict(color="#9E9E9E", width=1, dash="dot")))
+        fig.add_trace(go.Scatter(x=preview_t, y=scaled_q, name=f"Scaled ({profile_scale:.0%})", line=dict(color="#E91E63", width=2)))
+    else:
+        fig.add_trace(go.Scatter(x=preview_t, y=source_q, name="Planned output", line=dict(color="#E91E63", width=2)))
     fig.update_layout(xaxis_title="Time (s)", yaxis_title="Flow (mL/s)", height=350)
     st.plotly_chart(fig, use_container_width=True)
 
@@ -949,13 +995,11 @@ def page_run():
 
     if clear_results_btn:
         st.session_state["last_run_analysis"] = None
-        st.session_state["last_pump_log"] = None
         st.session_state["run_analysis_status"] = "Idle"
         st.info("Cleared saved run results")
 
     if abort_btn and link.is_open():
         stopped = link.hard_stop("manual abort button")
-        _store_pump_debug_log(link)
         st.session_state["run_analysis_status"] = "Idle"
         if stopped:
             st.warning("Abort/stop sequence sent")
@@ -963,8 +1007,13 @@ def page_run():
             st.error("Abort failed to send")
 
     if run_btn:
+        # Expected volume accounts for auto-scaling and speed
+        scaled_volume = float(np.trapezoid(scaled_q, source_t))
+        st.session_state["last_run_expected_volume"] = scaled_volume / max(speed, 1e-6)
+        # Playback wall-clock duration — used to fix the overlay X-axis range
+        st.session_state["last_run_source_duration"] = source_duration / max(speed, 1e-6)
         if mode == "Exact playback":
-            _run_exact(link, source_t, source_q, cfg["cal_factor"], speed)
+            _run_exact(link, source_t, scaled_q, cfg["cal_factor"], speed, effective_max_rpm)
         else:
             # Detect shape for template run
             fit = analyze_curve(source_t, source_q)
@@ -979,13 +1028,12 @@ def page_run():
         st.caption("These are the most recently captured sensor-analysis graphs from the automated test page.")
         _render_saved_run_analysis(saved_results)
 
-    pump_log = st.session_state.get("last_pump_log")
-    if pump_log:
-        _render_pump_debug_log(pump_log)
 
-
-def _run_exact(link, t, q, cal_factor, speed_mult):
+def _run_exact(link, t, q, cal_factor, speed_mult, max_rpm=None):
     """Stream the source curve point by point to the pump, with simultaneous sensor collection."""
+    if max_rpm is None:
+        max_rpm = PUMP_MAX_RPM
+
     if not link.is_open():
         st.error("Pump is not connected")
         st.session_state["run_analysis_status"] = "Idle"
@@ -995,8 +1043,6 @@ def _run_exact(link, t, q, cal_factor, speed_mult):
     st.session_state["last_run_analysis"] = None
     st.session_state["last_run_pdf"] = None
     st.session_state["last_run_pdf_for"] = None
-    st.session_state["last_pump_log"] = None
-    link.clear_log()
     sensor = st.session_state.sensor
     progress = st.progress(0.0, text="Streaming...")
     chart_slot = st.empty()
@@ -1013,24 +1059,26 @@ def _run_exact(link, t, q, cal_factor, speed_mult):
         return
 
     duration = float(t[-1])
-    expected_volume_ml = float(np.trapezoid(q, t)) if len(t) > 1 else 0.0
     playback_duration = duration / max(speed_mult, 1e-6)
-
-    # Do not flood the firmware with exact-playback RPM writes.
-    # The Feather controller applies each incoming RPM command via a real Modbus
-    # transaction, so trying to stream updates every 10 to 25 ms creates a serial
-    # backlog. That backlog makes the pump keep executing stale commands long
-    # after the source curve has changed. Be conservative here.
-    control_dt = max(0.20, min(0.35, playback_duration / 180.0))
+    control_dt = min(0.05, max(0.01, playback_duration / 1000.0))
 
     cmd_t, cmd_q, cmd_rpm = [], [], []
     last_rpm = None
-    last_serial_drain = 0.0
     link.drain()
 
-    # Start sensor collection
-    if sensor.is_open():
-        sensor.start_collecting()
+    # Verify the sensor stream is live before we start.  If the last packet
+    # arrived more than 3 s ago the BLE link may be stalled — warn the user
+    # but still proceed (start_collecting will attempt a restart in that case).
+    age = sensor.last_packet_age
+    if age is None or age > 3.0:
+        st.warning(
+            f"Sensor stream appears stale (last packet: {'never' if age is None else f'{age:.1f}s ago'}). "
+            "If no data is recorded after the run, disconnect and reconnect the sensor."
+        )
+
+    # Start sensor collection — always call stop in finally regardless of is_open()
+    # to handle BLE drops mid-run (is_open() may become False but _collecting stays True)
+    sensor.start_collecting()
 
     start = time.time()
 
@@ -1039,30 +1087,22 @@ def _run_exact(link, t, q, cal_factor, speed_mult):
             elapsed = time.time() - start
             src_elapsed = min(duration, elapsed * speed_mult)
             flow = float(np.interp(src_elapsed, t, q))
-            rpm = max(0.0, min(PUMP_MAX_RPM, flow / cal_factor))
+            rpm = max(0.0, min(max_rpm, flow / cal_factor))
             if rpm < MIN_RPM_THRESHOLD:
                 rpm = 0.0
 
             if last_rpm is None or abs(rpm - last_rpm) >= RPM_WRITE_EPSILON:
-                sent = link.write_realtime_line("0" if rpm <= 0 else f"{rpm:.3f}")
-                if not sent:
-                    status.error("Pump serial write failed during playback")
-                    break
-                last_rpm = rpm
-
-            if elapsed - last_serial_drain >= 0.1:
+                link.write_line("0" if rpm <= 0 else f"{rpm:.3f}")
                 link.drain()
-                last_serial_drain = elapsed
+                last_rpm = rpm
 
             cmd_t.append(src_elapsed)
             cmd_q.append(flow if rpm > 0 else 0.0)
             cmd_rpm.append(rpm)
 
             frac = min(1.0, src_elapsed / max(duration, 1e-6))
-            progress.progress(
-                frac,
-                text=f"{src_elapsed:.1f}/{duration:.1f}s  flow={flow:.2f} mL/s  rpm={rpm:.0f}  cmd_dt={control_dt:.2f}s",
-            )
+            samp = sensor.sample_count
+            progress.progress(frac, text=f"{src_elapsed:.1f}/{duration:.1f}s  flow={flow:.2f} mL/s  rpm={rpm:.0f}  samp={samp}")
 
             if src_elapsed >= duration:
                 break
@@ -1070,13 +1110,9 @@ def _run_exact(link, t, q, cal_factor, speed_mult):
     finally:
         if link.is_open():
             link.hard_stop("exact playback complete")
-        # Stop sensor collection
-        if sensor.is_open():
-            sensor.stop_collecting()
+        sensor.stop_collecting()  # Always stop — guards against BLE drop leaving _collecting=True
         progress.empty()
 
-    link.drain()
-    _store_pump_debug_log(link)
     status.success(f"Playback complete ({playback_duration:.1f}s wall time)")
     st.session_state["run_analysis_status"] = "Collecting and analyzing sensor data..."
 
@@ -1090,8 +1126,19 @@ def _run_exact(link, t, q, cal_factor, speed_mult):
         csv = df.to_csv(index=False).encode()
         st.download_button("Download log CSV", csv, file_name=f"playback_{int(time.time())}.csv")
 
+    # Display pump TX/RX log
+    if link.is_open():
+        with st.expander("Show pump TX/RX log"):
+            log_text = link.export_log_text()
+            if log_text:
+                st.code(log_text, language="text")
+                log_bytes = log_text.encode()
+                st.download_button("Download pump log", log_bytes, file_name=f"pump_log_{int(time.time())}.txt", key="pump_log_exact")
+            else:
+                st.info("No pump log available")
+
     # Analyze collected sensor data
-    _display_sensor_analysis(expected_volume_ml=expected_volume_ml)
+    _display_sensor_analysis()
 
 
 def _run_template(link, shape, qmax, volume, duration):
@@ -1105,19 +1152,17 @@ def _run_template(link, shape, qmax, volume, duration):
     st.session_state["last_run_analysis"] = None
     st.session_state["last_run_pdf"] = None
     st.session_state["last_run_pdf_for"] = None
-    st.session_state["last_pump_log"] = None
-    link.clear_log()
     sensor = st.session_state.sensor
     link.send(f"shape {shape}")
     link.send(f"qmax {qmax}")
     link.send(f"volume {volume}")
     link.send(f"duration {duration}")
 
-    # Start sensor collection before pump run
-    if sensor.is_open():
-        sensor.start_collecting()
+    # Start sensor collection before pump run — stop unconditionally in finally
+    sensor.start_collecting()
 
     if link.is_open() and not link.write_line("run"):
+        sensor.stop_collecting()
         st.error("Failed to send run command to pump")
         st.session_state["run_analysis_status"] = "Idle"
         return
@@ -1156,11 +1201,8 @@ def _run_template(link, shape, qmax, volume, duration):
     finally:
         if link.is_open():
             link.hard_stop("template run finalize")
-        # Stop sensor collection
-        if sensor.is_open():
-            sensor.stop_collecting()
+        sensor.stop_collecting()  # Always stop — guards against BLE drop leaving _collecting=True
 
-    _store_pump_debug_log(link)
     progress.empty()
     st.session_state["run_analysis_status"] = "Collecting and analyzing sensor data..."
 
@@ -1174,8 +1216,19 @@ def _run_template(link, shape, qmax, volume, duration):
         csv = df.to_csv(index=False).encode()
         st.download_button("Download log CSV", csv, file_name=f"run_{int(time.time())}.csv")
 
+    # Display pump TX/RX log
+    if link.is_open():
+        with st.expander("Show pump TX/RX log"):
+            log_text = link.export_log_text()
+            if log_text:
+                st.code(log_text, language="text")
+                log_bytes = log_text.encode()
+                st.download_button("Download pump log", log_bytes, file_name=f"pump_log_{int(time.time())}.txt", key="pump_log_template")
+            else:
+                st.info("No pump log available")
+
     # Analyze collected sensor data
-    _display_sensor_analysis(expected_volume_ml=float(volume))
+    _display_sensor_analysis()
 
 
 def _parse_telemetry(line):
@@ -1194,38 +1247,76 @@ def _parse_telemetry(line):
     return vals
 
 
-def _store_pump_debug_log(link):
-    st.session_state["last_pump_log"] = link.snapshot_log()
+def _build_overlay_figure(results):
+    """Single overlaid chart matching Flutter's GraphWidget layout."""
+    t_arr = np.asarray(results["t_arr"], dtype=float)
+    filt_mass = np.asarray(results["filt_mass"], dtype=float)
+    kz_flow = np.asarray(results["kz_flow"], dtype=float)
+    empty = results["empty"]
+    voiding = results["voiding"]
+    draining = results["draining"]
+    roi = results.get("roi", [0, max(0, len(t_arr) - 1)])
 
+    fig = go.Figure()
 
-def _render_pump_debug_log(log_rows):
-    if not log_rows:
-        return
+    def _vrect(zones, color):
+        for z in zones:
+            s = max(0, min(int(z[0]), len(t_arr) - 1))
+            e = max(0, min(int(z[1]), len(t_arr) - 1))
+            if len(t_arr) and e >= s:
+                fig.add_vrect(x0=t_arr[s], x1=t_arr[e], fillcolor=color, line_width=0)
 
-    tx_count = sum(1 for _, direction, _ in log_rows if direction == "tx")
-    rx_count = sum(1 for _, direction, _ in log_rows if direction == "rx")
-    err_count = sum(1 for _, direction, _ in log_rows if direction == "err")
-    sys_count = sum(1 for _, direction, _ in log_rows if direction == "sys")
+    # ROI highlight
+    if len(roi) == 2 and len(t_arr):
+        rs = max(0, min(int(roi[0]), len(t_arr) - 1))
+        re = max(0, min(int(roi[1]), len(t_arr) - 1))
+        fig.add_vrect(x0=t_arr[rs], x1=t_arr[re], fillcolor="rgba(135,206,250,0.15)", line_width=0)
 
-    st.divider()
-    st.subheader("Pump Debug Log")
-    dbg_cols = st.columns(4)
-    dbg_cols[0].metric("Entries", len(log_rows))
-    dbg_cols[1].metric("TX", tx_count)
-    dbg_cols[2].metric("RX", rx_count)
-    dbg_cols[3].metric("ERR/SYS", err_count + sys_count)
+    _vrect(empty,    "rgba(158,158,158,0.12)")
+    _vrect(draining, "rgba(255,152,0,0.22)")
+    _vrect(voiding,  "rgba(76,175,80,0.28)")
 
-    log_text = "\n".join(f"[{ts}] {direction.upper():>3} {text}" for ts, direction, text in log_rows)
-    log_key = f"{len(log_rows)}_{log_rows[-1][0].replace(':', '-') if log_rows else 'empty'}"
-    st.download_button(
-        "Download pump debug log",
-        data=log_text.encode(),
-        file_name=f"pump_debug_{log_key}.log",
-        mime="text/plain",
-        key=f"download_pump_debug_{log_key}",
+    # ROI boundary dashed lines
+    if len(roi) == 2 and len(t_arr):
+        rs = max(0, min(int(roi[0]), len(t_arr) - 1))
+        re = max(0, min(int(roi[1]), len(t_arr) - 1))
+        fig.add_vline(x=t_arr[rs], line_dash="dash", line_color="#9E9E9E", line_width=1)
+        fig.add_vline(x=t_arr[re], line_dash="dash", line_color="#9E9E9E", line_width=1)
+
+    # Mass trace
+    n_mass = min(len(t_arr), len(filt_mass))
+    fig.add_trace(go.Scatter(
+        x=t_arr[:n_mass], y=filt_mass[:n_mass],
+        name="Mass (g)", line=dict(color="#2196F3", width=2.5),
+    ))
+
+    # KZ flow — auto-scaled so peak = 40% of mass peak (matches Flutter)
+    if len(kz_flow) > 0 and np.max(kz_flow) > 0:
+        mass_peak = float(np.max(filt_mass)) if len(filt_mass) > 0 and np.max(filt_mass) > 0 else 1.0
+        flow_peak = float(np.max(kz_flow))
+        scale = (mass_peak * 0.4) / flow_peak
+        n_flow = min(len(t_arr), len(kz_flow))
+        fig.add_trace(go.Scatter(
+            x=t_arr[:n_flow], y=kz_flow[:n_flow] * scale,
+            name=f"KZ Flow (×{scale:.2f})", line=dict(color="#E91E63", width=2),
+        ))
+
+    x_min = float(t_arr[0]) if len(t_arr) else 0.0
+    x_max = float(t_arr[-1]) if len(t_arr) else 1.0
+    # Override with stored source duration if available (e.g. from CSV profile)
+    src_dur = results.get("source_duration")
+    if src_dur and src_dur > 0:
+        x_max = float(src_dur)
+
+    fig.update_layout(
+        xaxis_title="Time (s)", yaxis_title="Mass (g)",
+        xaxis_range=[x_min, x_max],
+        height=500,
+        showlegend=True,
+        legend=dict(x=0.01, y=0.99, bgcolor="rgba(0,0,0,0.05)", borderwidth=1),
+        margin=dict(t=10, b=40),
     )
-    with st.expander("Show pump TX/RX log", expanded=False):
-        st.code(log_text or "(empty)", language="text")
+    return fig
 
 
 def _build_run_analysis_figures(results):
@@ -1259,23 +1350,6 @@ def _build_run_analysis_figures(results):
     fig_raw.add_trace(go.Scatter(x=t_arr[:len(raw_mass)], y=raw_mass, name="Raw Weight", line=dict(color="#1E88E5", width=2)))
     fig_raw.update_layout(title="Raw Weight vs Time", xaxis_title="Time (s)", yaxis_title="Weight (g)", height=340, showlegend=False)
 
-    fig_mass = go.Figure()
-    fig_mass.add_trace(go.Scatter(x=t_arr[:len(filt_mass)], y=filt_mass, name="Filtered Mass", line=dict(color="#2196F3", width=2)))
-    _add_zone_rects(fig_mass, empty, "rgba(158,158,158,0.10)")
-    _add_zone_rects(fig_mass, draining, "rgba(255,152,0,0.18)")
-    _add_zone_rects(fig_mass, voiding, "rgba(76,175,80,0.18)")
-    _add_roi_lines(fig_mass)
-    fig_mass.update_layout(title="Mass vs Time (with zones)", xaxis_title="Time (s)", yaxis_title="Mass (g)", height=380, showlegend=False)
-
-    fig_inflow = go.Figure()
-    if len(filt_inflow):
-        fig_inflow.add_trace(go.Scatter(x=t_arr[:len(filt_inflow)], y=filt_inflow, name="Filtered Inflow", line=dict(color="#5E35B1", width=2)))
-    _add_zone_rects(fig_inflow, empty, "rgba(158,158,158,0.10)")
-    _add_zone_rects(fig_inflow, draining, "rgba(255,152,0,0.18)")
-    _add_zone_rects(fig_inflow, voiding, "rgba(76,175,80,0.18)")
-    _add_roi_lines(fig_inflow)
-    fig_inflow.update_layout(title="Filtered Inflow vs Time", xaxis_title="Time (s)", yaxis_title="Flow Rate (g/s)", height=340, showlegend=False)
-
     fig_kz = go.Figure()
     fig_kz.add_trace(go.Scatter(x=t_arr[:len(kz_flow)], y=kz_flow, name="KZ Flow", line=dict(color="#8E24AA", width=2.5)))
     _add_zone_rects(fig_kz, empty, "rgba(158,158,158,0.10)")
@@ -1289,28 +1363,26 @@ def _build_run_analysis_figures(results):
     fig_fm.add_trace(go.Scatter(x=filt_mass[:n_fm], y=kz_flow[:n_fm], name="Flow vs Mass", mode="lines", line=dict(color="#AB47BC", width=2), fill="tozeroy"))
     fig_fm.update_layout(title="Flow Rate vs Mass", xaxis_title="Mass (g)", yaxis_title="Flow Rate (g/s)", height=340, showlegend=False)
 
+    fig_vol = go.Figure()
+    fig_vol.add_trace(go.Scatter(x=t_arr[:len(cum_volume)], y=cum_volume, name="Cumulative Volume", line=dict(color="#43A047", width=2), fill="tozeroy"))
+    fig_vol.update_layout(title="Cumulative Volume vs Time", xaxis_title="Time (s)", yaxis_title="Cumulative Volume (mL)", height=340, showlegend=False)
+
     fig_cal = go.Figure()
     if len(cal_map) >= 2 and cal_map[0] and cal_map[1]:
         fig_cal.add_trace(go.Scatter(x=cal_map[0], y=cal_map[1], name="Calibration Map", mode="lines", line=dict(color="#1E88E5", width=2), fill="tozeroy"))
-    fig_cal.update_layout(title="Calibration Map", xaxis_title="Mass (g)", yaxis_title="Drain Rate (g/s)", height=340, showlegend=False)
-
-    fig_vol = go.Figure()
-    fig_vol.add_trace(go.Scatter(x=t_arr[:len(cum_volume)], y=cum_volume, name="Cumulative Volume", line=dict(color="#43A047", width=2), fill="tozeroy"))
-    fig_vol.update_layout(title="Cumulative Volume vs Time", xaxis_title="Time (s)", yaxis_title="Cumulative Volume (g)", height=340, showlegend=False)
+    fig_cal.update_layout(title="Calibration Map (Drain Rate vs Mass)", xaxis_title="Mass (g)", yaxis_title="Drain Rate (g/s)", height=340, showlegend=False)
 
     return [
         ("Raw Weight vs Time", fig_raw),
-        ("Mass vs Time (with zones)", fig_mass),
-        ("Filtered Inflow vs Time", fig_inflow),
         ("Flow Rate vs Time (KZ smoothed)", fig_kz),
         ("Flow Rate vs Mass", fig_fm),
-        ("Calibration Map", fig_cal),
         ("Cumulative Volume vs Time", fig_vol),
+        ("Calibration Map", fig_cal),
     ]
 
 
 def _build_run_analysis_pdf(results):
-    figures = _build_run_analysis_figures(results)
+    figures = [("Overview", _build_overlay_figure(results))] + _build_run_analysis_figures(results)
     images = []
     for _, fig in figures:
         png_bytes = pio.to_image(fig, format="png", width=1600, height=900, scale=1)
@@ -1326,6 +1398,7 @@ def _build_run_analysis_pdf(results):
 
 def _render_saved_run_analysis(results):
     t_arr = np.asarray(results["t_arr"], dtype=float)
+    filt_mass = np.asarray(results["filt_mass"], dtype=float)
     kz_flow = np.asarray(results["kz_flow"], dtype=float)
     cum_volume = np.asarray(results["cum_volume"], dtype=float)
     empty = results["empty"]
@@ -1333,80 +1406,170 @@ def _render_saved_run_analysis(results):
     draining = results["draining"]
     roi = results.get("roi", [0, max(0, len(t_arr) - 1)])
 
-    duration = t_arr[-1] - t_arr[0] if len(t_arr) > 1 else 0
-    total_vol_g = float(cum_volume[-1]) if len(cum_volume) > 0 else 0.0
-    measured_volume_ml = float(results.get("measured_volume_ml", total_vol_g / 0.9982 if total_vol_g else 0.0))
-    expected_volume_ml = results.get("expected_volume_ml")
-    raw_difference_ml = results.get("raw_difference_ml")
-    percent_difference = results.get("percent_difference")
+    # ── summary metrics ────────────────────────────────────────────────
+    duration = float(t_arr[-1] - t_arr[0]) if len(t_arr) > 1 else 0.0
+    n_samples = len(t_arr)
+    inferred_fs = (n_samples - 1) / duration if duration > 0 else 0.0
+    peak_flow = float(np.max(kz_flow)) if len(kz_flow) else 0.0
+    total_vol = float(cum_volume[-1]) if len(cum_volume) > 0 else 0.0
+    mass_change = float(filt_mass[-1] - filt_mass[0]) if len(filt_mass) > 1 else 0.0
 
-    cols = st.columns(4)
+    cols = st.columns(5)
     cols[0].metric("Duration", f"{duration:.1f} s")
-    cols[1].metric("Peak Flow", f"{np.max(kz_flow):.2f} g/s" if len(kz_flow) else "0.00 g/s")
-    cols[2].metric("Measured Volume", f"{total_vol_g:.1f} g ({measured_volume_ml:.1f} mL)")
-    cols[3].metric("Zones", f"V:{len(voiding)} D:{len(draining)} E:{len(empty)}")
+    cols[1].metric("Samples / Rate", f"{n_samples} / {inferred_fs:.1f} Hz")
+    cols[2].metric("Peak Flow", f"{peak_flow:.2f} g/s")
+    cols[3].metric("Cumul. Volume", f"{total_vol:.0f} g  ({total_vol/0.9982:.0f} mL)")
+    cols[4].metric("Mass change", f"{mass_change:+.0f} g")
 
-    if expected_volume_ml is not None:
-        err_cols = st.columns(3)
-        err_cols[0].metric("Expected Volume", f"{float(expected_volume_ml):.1f} mL")
-        err_cols[1].metric(
-            "Raw Difference",
-            f"{float(raw_difference_ml):+.1f} mL" if raw_difference_ml is not None else "n/a",
-            help="Measured sensor volume minus expected CSV/template volume.",
+    # ── volume / sensor calibration diagnostic ─────────────────────────
+    expected_vol = float(results.get("expected_volume_mL", 0.0))
+    cal_used = float(results.get("sensor_cal_factor_used", DEFAULT_CALIBRATION_FACTOR))
+    if expected_vol > 0 and total_vol > 0.5:
+        ratio = expected_vol / total_vol
+        implied_factor = cal_used * ratio
+        pct_error = abs(expected_vol - total_vol) / expected_vol * 100.0
+        colour = "green" if pct_error < 10 else ("orange" if pct_error < 50 else "red")
+        st.markdown(
+            f"**Volume accuracy:** sensor reported **{total_vol:.0f} mL**, "
+            f"expected **{expected_vol:.0f} mL** "
+            f"— :{colour}[**{pct_error:.1f}% error**]"
         )
-        err_cols[2].metric(
-            "Percent Difference",
-            f"{float(percent_difference):+.2f}%" if percent_difference is not None else "n/a",
-            help="(Measured - expected) / expected * 100",
-        )
+        if abs(ratio - 1.0) > 0.05:
+            with st.expander("Fix sensor calibration factor", expanded=(abs(ratio - 1.0) > 0.20)):
+                st.markdown(
+                    f"The sensor cal factor **{cal_used:.8f}** needs to be scaled by **{ratio:.3f}×** "
+                    f"to match the expected volume.\n\n"
+                    f"**Implied correct factor: `{implied_factor:.8f}`**\n\n"
+                    f"This is computed as `current_factor × (expected_volume / measured_volume)` "
+                    f"= `{cal_used:.8f} × ({expected_vol:.0f} / {total_vol:.0f})`.\n\n"
+                    f"You can also override the expected volume below if you measured the actual output."
+                )
+                override_vol = st.number_input(
+                    "Override expected volume (mL) — leave as-is to use CSV value",
+                    value=float(expected_vol), min_value=1.0, step=10.0,
+                    key=f"override_vol_{int(results.get('saved_at', 0))}",
+                )
+                if override_vol != expected_vol:
+                    implied_factor = cal_used * (override_vol / max(total_vol, 0.01))
+                    st.info(f"With override: implied factor = {implied_factor:.8f}")
+
+                cfg = st.session_state.cfg
+                sensor_obj = st.session_state.sensor
+                if st.button("Apply corrected sensor cal factor", key=f"apply_cal_{int(results.get('saved_at', 0))}"):
+                    cfg["sensor_cal_factor"] = implied_factor
+                    sensor_obj.calibration_factor = implied_factor
+                    _save_cfg(cfg)
+                    st.success(f"Sensor cal factor updated to {implied_factor:.8f}. Re-run the test to verify.")
+                    st.rerun()
 
     saved_at = int(results.get("saved_at", 0))
     if st.session_state.get("last_run_pdf_for") != saved_at:
         st.session_state["last_run_pdf"] = None
         st.session_state["last_run_pdf_for"] = saved_at
 
-    pdf_col1, pdf_col2 = st.columns([1, 2])
-    with pdf_col1:
+    pdf_bytes = st.session_state.get("last_run_pdf")
+    if pdf_bytes is not None:
+        # PDF was auto-generated — offer immediate download + JS auto-trigger
+        dl_col, regen_col = st.columns([2, 1])
+        with dl_col:
+            st.download_button(
+                "Download graphs as PDF",
+                data=pdf_bytes,
+                file_name=f"autoflow_graphs_{saved_at}.pdf",
+                mime="application/pdf",
+                key=f"download_pdf_{saved_at}",
+                type="primary",
+                use_container_width=True,
+            )
+        with regen_col:
+            if st.button("Regenerate PDF", key=f"regen_pdf_{saved_at}", use_container_width=True):
+                try:
+                    with st.spinner("Rendering PDF..."):
+                        st.session_state["last_run_pdf"] = _build_run_analysis_pdf(results)
+                        st.session_state["last_run_pdf_for"] = saved_at
+                    st.rerun()
+                except Exception as e:
+                    st.warning(f"PDF export failed: {e}")
+
+        # Auto-trigger download in browser on first appearance
+        if st.session_state.get("auto_download_pdf"):
+            pdf_b64 = base64.b64encode(pdf_bytes).decode()
+            fname = f"autoflow_graphs_{saved_at}.pdf"
+            st.components.v1.html(
+                f"""<script>
+                (function(){{
+                    var a = document.createElement('a');
+                    a.href = 'data:application/pdf;base64,{pdf_b64}';
+                    a.download = '{fname}';
+                    document.body.appendChild(a);
+                    a.click();
+                    document.body.removeChild(a);
+                }})();
+                </script>""",
+                height=0,
+            )
+            st.session_state["auto_download_pdf"] = False
+    else:
         if st.button("Prepare PDF", key=f"prepare_pdf_{saved_at}"):
             try:
                 with st.spinner("Rendering PDF from graphs..."):
                     st.session_state["last_run_pdf"] = _build_run_analysis_pdf(results)
+                    st.session_state["last_run_pdf_for"] = saved_at
+                st.rerun()
             except Exception as e:
-                st.session_state["last_run_pdf"] = None
                 st.warning(f"PDF export unavailable right now: {e}")
-    with pdf_col2:
-        if st.session_state.get("last_run_pdf") is not None:
-            st.download_button(
-                "Download graphs as PDF",
-                data=st.session_state["last_run_pdf"],
-                file_name=f"autoflow_graphs_{saved_at}.pdf",
-                mime="application/pdf",
-                key=f"download_pdf_{saved_at}",
-            )
 
-    for _, fig in _build_run_analysis_figures(results):
-        st.plotly_chart(fig, use_container_width=True)
+    # ── primary overlay chart (Flutter-style: all traces on one plot) ──
+    st.plotly_chart(_build_overlay_figure(results), use_container_width=True)
 
-    st.markdown("**Zone Analysis Results**")
-    st.code(
-        "\n".join([
-            f"Empty Zones: {empty}",
-            f"Voiding Zones: {voiding}",
-            f"Draining Zones: {draining}",
-            f"ROI: {roi}",
-        ]),
-        language="text",
-    )
+    # ── legend ─────────────────────────────────────────────────────────
+    leg_cols = st.columns(6)
+    for col, (color, label) in zip(leg_cols, [
+        ("#2196F3", "Mass"),
+        ("#E91E63", "KZ Flow (scaled)"),
+        ("rgba(76,175,80,0.5)", "Voiding"),
+        ("rgba(255,152,0,0.5)", "Draining"),
+        ("rgba(158,158,158,0.5)", "Empty"),
+        ("rgba(135,206,250,0.5)", "ROI"),
+    ]):
+        col.markdown(
+            f'<span style="display:inline-block;width:14px;height:10px;background:{color};'
+            f'border-radius:2px;margin-right:4px"></span>{label}',
+            unsafe_allow_html=True,
+        )
+
+    # ── detailed individual charts ─────────────────────────────────────
+    with st.expander("Detailed individual charts"):
+        for _, fig in _build_run_analysis_figures(results):
+            st.plotly_chart(fig, use_container_width=True)
+
+        st.markdown("**Zone Analysis Results**")
+        st.code(
+            "\n".join([
+                f"Empty Zones: {empty}",
+                f"Voiding Zones: {voiding}",
+                f"Draining Zones: {draining}",
+                f"ROI: {roi}",
+            ]),
+            language="text",
+        )
 
 
-def _display_sensor_analysis(expected_volume_ml=None):
+def _display_sensor_analysis():
     """Analyze and display collected sensor data after pump run."""
     sensor = st.session_state.sensor
     t_data, m_data, _ = sensor.get_data()
 
     if not t_data or len(t_data) < 3:
         st.session_state["run_analysis_status"] = "No sensor analysis available"
-        st.info("No sensor data collected during pump run.")
+        age = sensor.last_packet_age
+        age_str = f"{age:.1f}s ago" if age is not None else "never"
+        st.error(
+            f"No sensor data was collected during the run ({len(t_data)} samples). "
+            f"Last packet from sensor: **{age_str}**.\n\n"
+            "**Fix:** the sensor BLE stream stalled. Disconnect the sensor in the sidebar, "
+            "reconnect, wait until you see live readings updating, then run again."
+        )
         return
 
     # Get calibration map
@@ -1417,20 +1580,8 @@ def _display_sensor_analysis(expected_volume_ml=None):
     m_arr = np.asarray(m_data, dtype=float)
     filt_mass, filt_inflow, kz_flow, cum_volume, empty, voiding, draining, roi = compute_flow_from_mass(t_arr, m_arr, cal_map)
 
-    measured_volume_g = float(cum_volume[-1]) if len(cum_volume) > 0 else 0.0
-    measured_volume_ml = measured_volume_g / 0.9982 if measured_volume_g else 0.0
-
-    raw_difference_ml = None
-    percent_difference = None
-    if expected_volume_ml is not None:
-        expected_volume_ml = float(expected_volume_ml)
-        raw_difference_ml = measured_volume_ml - expected_volume_ml
-        if abs(expected_volume_ml) > 1e-9:
-            percent_difference = (raw_difference_ml / expected_volume_ml) * 100.0
-
-    st.session_state["last_run_pdf"] = None
-    st.session_state["last_run_pdf_for"] = None
-    st.session_state["last_run_analysis"] = {
+    saved_at = time.time()
+    analysis = {
         "t_arr": t_arr.tolist(),
         "raw_mass": m_arr.tolist(),
         "filt_mass": np.asarray(filt_mass, dtype=float).tolist(),
@@ -1442,14 +1593,28 @@ def _display_sensor_analysis(expected_volume_ml=None):
         "voiding": voiding,
         "draining": draining,
         "roi": roi,
-        "expected_volume_ml": expected_volume_ml,
-        "measured_volume_g": measured_volume_g,
-        "measured_volume_ml": measured_volume_ml,
-        "raw_difference_ml": raw_difference_ml,
-        "percent_difference": percent_difference,
-        "saved_at": time.time(),
+        "saved_at": saved_at,
+        "expected_volume_mL": st.session_state.get("last_run_expected_volume", 0.0),
+        "sensor_cal_factor_used": sensor.calibration_factor,
+        "source_duration": st.session_state.get("last_run_source_duration", 0.0),
     }
+    st.session_state["last_run_analysis"] = analysis
     st.session_state["run_analysis_status"] = "Graphs ready"
+
+    # Auto-generate PDF so it's ready for immediate download
+    try:
+        with st.spinner("Generating PDF report..."):
+            pdf_bytes = _build_run_analysis_pdf(analysis)
+        if pdf_bytes:
+            st.session_state["last_run_pdf"] = pdf_bytes
+            st.session_state["last_run_pdf_for"] = saved_at
+            st.session_state["auto_download_pdf"] = True
+        else:
+            st.session_state["last_run_pdf"] = None
+            st.session_state["last_run_pdf_for"] = None
+    except Exception:
+        st.session_state["last_run_pdf"] = None
+        st.session_state["last_run_pdf_for"] = None
 
     return
 

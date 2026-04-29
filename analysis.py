@@ -1,7 +1,7 @@
 """Flow analysis: shape templates, curve fitting, KZ filter, zone detection."""
 
 import numpy as np
-from scipy.signal import lfilter
+from scipy.signal import butter, filtfilt
 
 
 # ---------------------------------------------------------------------------
@@ -141,16 +141,26 @@ FILTER_CUTOFF = 2.0
 PRE_FLOW_TIME = 3
 POST_FLOW_TIME = 5
 SAMPLING_RATE = 40
+FILTER_ORDER = 4
 
-# Hardcoded Butterworth coefficients used by the Flutter app.
-_B = np.array([0.02008337, 0.04016673, 0.02008337])
-_A = np.array([1.0, -1.56101808, 0.64135154])
+# Order-4 Butterworth low-pass at FILTER_CUTOFF Hz, sampled at SAMPLING_RATE Hz.
+# This MUST match what the Flutter app does in filter.dart's
+# SciPyFiltfiltLowpass — same order, same cutoff, same sample rate, applied
+# via filtfilt (zero-phase). The previous hardcoded 2nd-order coefficients
+# combined with single-pass lfilter introduced a phase shift and weaker
+# attenuation, which is why exact-playback flow plots came out distorted
+# while the Flutter app's plots from the same hardware looked correct.
+_B, _A = butter(FILTER_ORDER, FILTER_CUTOFF, btype="low", fs=SAMPLING_RATE)
 
 
 def lowpass_filter(data):
-    if len(data) < 6:
-        return np.array(data, dtype=float)
-    return np.array(lfilter(_B, _A, data), dtype=float)
+    arr = np.asarray(data, dtype=float)
+    # filtfilt needs at least padlen+1 samples (default padlen ≈ 3*max(len(a),len(b)))
+    # so for short inputs fall back to returning the raw signal unchanged.
+    min_len = 3 * max(len(_A), len(_B)) + 1
+    if len(arr) < min_len:
+        return arr
+    return np.asarray(filtfilt(_B, _A, arr), dtype=float)
 
 
 def get_derivative(t, data, ss=2):
@@ -188,9 +198,13 @@ def kz_filter(data, window=9, iterations=3):
 
 def identify_zones(raw_data, filt_mass_rate, calibration_map, filt_mass):
     mass_thresh = 3.0
-    flow_rate_thresh = 2.0
     window_len = 5
     voiding, draining, empty = [], [], []
+
+    # Adaptive threshold: scale down for low-flow scenarios (e.g. bench pump testing
+    # at < 2 g/s) while preserving the clinical 2.0 g/s floor when flow is high.
+    peak_rate = float(np.max(np.abs(filt_mass_rate))) if len(filt_mass_rate) > 0 else 2.0
+    flow_rate_thresh = min(2.0, max(0.1, peak_rate * 0.4))
 
     for zone in range(0, len(raw_data), window_len):
         end = min(zone + window_len, len(raw_data))
@@ -200,9 +214,10 @@ def identify_zones(raw_data, filt_mass_rate, calibration_map, filt_mass):
         drain = _corresponding_drain_rate(calibration_map, avg_temp)
 
         all_above_mass = all(x > mass_thresh for x in temp_data)
-        if all_above_mass and all((r - drain) > flow_rate_thresh for r in temp_rate):
+        avg_net = float(np.mean([r - drain for r in temp_rate]))
+        if all_above_mass and avg_net > flow_rate_thresh:
             voiding.append([zone, end])
-        elif all_above_mass and all((r - drain) < -flow_rate_thresh for r in temp_rate):
+        elif all_above_mass and avg_net < -flow_rate_thresh:
             draining.append([zone, end])
         elif all_above_mass:
             draining.append([zone, end])
@@ -251,7 +266,14 @@ def compute_flow_from_mass(t, y, calibration_map):
         inflow[i] = max(0.0, filt_mass_rate[i] - drain)
 
     filt_inflow = lowpass_filter(inflow)
-    kz_flow = kz_filter(filt_inflow, window=9, iterations=3)
+
+    # Smooth over 4 seconds to cancel peristaltic pulsation regardless of
+    # actual sample rate. Must be odd and at least 3.
+    actual_fs = (n - 1) / (t[n - 1] - t[0]) if n >= 2 and t[n - 1] > t[0] else SAMPLING_RATE
+    kz_win = max(3, int(4.0 * actual_fs))
+    if kz_win % 2 == 0:
+        kz_win += 1
+    kz_flow = kz_filter(filt_inflow, window=kz_win, iterations=3)
 
     cum_volume = np.zeros(n)
     acc = 0.0

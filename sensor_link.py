@@ -171,6 +171,12 @@ class SensorLink:
         self._last_ble_time_s = None
         self._ble_debug_count = 0
 
+        # Wall-clock time of the most recent packet from the sensor (any mode).
+        # Used in start_collecting() to decide whether the stream is active so
+        # we can skip the BLE notify-restart that was the primary cause of
+        # intermittent data loss.
+        self._last_packet_wall_time: float | None = None
+
         atexit.register(self.close)
 
     # ── public status ──────────────────────────────────────────────────
@@ -237,7 +243,15 @@ class SensorLink:
         self._start_reader_thread(lambda: self._run_ble_session(address, name_hint or None))
         self._ble_ready.wait(timeout=15.0)
         if self._ble_connected:
-            self._status = f"BLE connected, waiting for data: {address}"
+            # Don't fail the connect if no packet has arrived yet. The
+            # firmware was historically slow to start streaming, and
+            # "Start Collecting" later does a notify-restart cycle that
+            # sometimes kicks it loose. Leave the link up so the user can
+            # try that path.
+            if self._ble_first_packet.wait(timeout=2.0):
+                self._status = f"BLE streaming: {address}"
+            else:
+                self._status = f"BLE connected, no data yet: {address}"
             return True
         self.close()
         if not self._last_error:
@@ -314,6 +328,9 @@ class SensorLink:
     # ── collection ─────────────────────────────────────────────────────
 
     def start_collecting(self):
+        # Drop samples while we reset the buffer so no stale data leaks in.
+        self._collecting = False
+
         with self._lock:
             self._timestamps.clear()
             self._masses.clear()
@@ -321,13 +338,35 @@ class SensorLink:
             self._time_offset = None
 
         if self.mode == "ble" and self._ble_loop and self._ble_client and self._ble_connected:
-            self._ble_first_packet.clear()
-            self._status = f"BLE connected, refreshing stream: {self.port}"
-            try:
-                future = asyncio.run_coroutine_threadsafe(self._ble_restart_notify(), self._ble_loop)
-                future.result(timeout=5.0)
-            except Exception as e:
-                self._set_error(f"BLE stream refresh failed: {e}")
+            # Only restart BLE notifications when the stream looks genuinely
+            # stuck (no packet in the past 3 s).  Restarting an active stream
+            # is the primary cause of intermittent data loss: stop_notify()
+            # kills the stream for at least 150 ms, and some BLE devices take
+            # much longer to resume — sometimes never recovering within the run.
+            # When the stream is healthy we simply clear the buffer above and
+            # let the already-flowing notifications start filling it again.
+            now = time.time()
+            last = self._last_packet_wall_time
+            stream_stale = (last is None) or ((now - last) > 3.0)
+
+            if stream_stale:
+                # Clear the partial-packet text buffer so a half-received line
+                # from before the restart cannot merge with the new stream.
+                self._ble_buffer = b""
+                # Reset the timestamp-jump guard so the first post-restart
+                # sample is not silently dropped as a "suspicious" jump.
+                self._last_ble_time_s = None
+                self._ble_first_packet.clear()
+                self._status = f"BLE connected, refreshing stream: {self.port}"
+                try:
+                    future = asyncio.run_coroutine_threadsafe(
+                        self._ble_restart_notify(), self._ble_loop
+                    )
+                    future.result(timeout=5.0)
+                except Exception as e:
+                    self._set_error(f"BLE stream refresh failed: {e}")
+            # else: stream is active — notifications are already flowing into
+            # the now-empty buffer, no disruption needed.
 
         self._collecting = True
 
@@ -346,6 +385,12 @@ class SensorLink:
     def sample_count(self):
         with self._lock:
             return len(self._timestamps)
+
+    @property
+    def last_packet_age(self) -> float | None:
+        """Seconds since the last packet from the sensor, or None if never received."""
+        last = self._last_packet_wall_time
+        return (time.time() - last) if last is not None else None
 
     # ── reader threads ─────────────────────────────────────────────────
 
@@ -410,6 +455,13 @@ class SensorLink:
             self._ble_loop = None
 
     async def _ble_session(self, address, name_hint=None):
+        # Pass the raw address straight to BleakClient on macOS — that's what
+        # the original (pre-debug) code did, and it's what produced the
+        # "sometimes works" path. Adding a discovery scan ahead of connect
+        # changed the ordering of CoreBluetooth state in a way that broke
+        # the intermittent-success behavior. On Windows we still need to
+        # resolve to a BLEDevice because the WinRT backend behaves better
+        # that way.
         device_or_address = address
         if platform.system() == "Windows":
             resolved = await self._resolve_ble_device(address, name_hint=name_hint)
@@ -421,13 +473,45 @@ class SensorLink:
         try:
             await client.connect(timeout=15.0)
             services = await self._get_ble_services(client)
+
+            # Print the negotiated MTU. On macOS bleak does not request a
+            # specific MTU, so this is whatever CoreBluetooth chose. If the
+            # Xiao firmware bundles multiple samples per notification it
+            # may refuse to transmit until MTU exceeds the bundle size,
+            # which would silently appear as "subscribed but no data".
+            try:
+                mtu = getattr(client, "mtu_size", None)
+                print(f"BLE negotiated MTU: {mtu}")
+            except Exception as e:
+                print(f"BLE MTU read failed: {e}")
+
+            # Print everything bleak resolved so we can see whether the
+            # service/characteristic discovery actually saw the streaming
+            # characteristic and what properties it has. If this prints
+            # "notify=False", the firmware is exposing the wrong char or
+            # the OS is using a stale GATT cache.
+            print("BLE discovered services:")
+            for svc in services:
+                print(f"  service {svc.uuid}")
+                for ch in svc.characteristics:
+                    props = ",".join(ch.properties) if ch.properties else "-"
+                    print(f"    char {ch.uuid}  props={props}")
+
             target_char = self._find_ble_notify_characteristic(services)
+            target_props = ",".join(target_char.properties) if target_char.properties else "-"
+            print(f"BLE target char {target_char.uuid} props={target_props}")
 
             self._ble_notify_uuid = target_char.uuid
             await client.start_notify(target_char.uuid, self._ble_notification_handler)
+            # Give the CCCD enable a moment to propagate end-to-end before we
+            # declare the link ready. On macOS, start_notify returns as soon
+            # as the local CoreBluetooth callback fires, which can race with
+            # the peripheral actually flipping into "send notifications" mode.
+            await asyncio.sleep(0.3)
             self._ble_connected = True
             self._status = f"BLE connected, waiting for data: {address}"
             self._last_error = ""
+            print(f"BLE notify started on {target_char.uuid}; waiting for first packet")
             self._ble_ready.set()
 
             while not self._stop_event.is_set() and client.is_connected:
@@ -448,16 +532,27 @@ class SensorLink:
             self._ble_first_packet.clear()
 
     async def _ble_disconnect(self):
-        if self._ble_client is not None and self._ble_client.is_connected:
-            if self._ble_notify_uuid:
+        # Snapshot the client and notify UUID locally. close() runs on a
+        # different thread and clears these fields concurrently; without the
+        # snapshot we can race and dereference None inside this coroutine
+        # ("'NoneType' object has no attribute 'disconnect'").
+        client = self._ble_client
+        notify_uuid = self._ble_notify_uuid
+        try:
+            if client is not None and client.is_connected:
+                if notify_uuid:
+                    try:
+                        await client.stop_notify(notify_uuid)
+                    except Exception:
+                        pass
                 try:
-                    await self._ble_client.stop_notify(self._ble_notify_uuid)
+                    await client.disconnect()
                 except Exception:
                     pass
-            await self._ble_client.disconnect()
-        self._ble_connected = False
-        self._ble_notify_uuid = None
-        self._ble_first_packet.clear()
+        finally:
+            self._ble_connected = False
+            self._ble_notify_uuid = None
+            self._ble_first_packet.clear()
 
     async def _ble_restart_notify(self):
         if self._ble_client is None or not self._ble_client.is_connected or not self._ble_notify_uuid:
@@ -634,6 +729,11 @@ class SensorLink:
         self._add_sample(raw_value, raw_time_s)
 
     def _add_sample(self, raw_value: float, raw_time_s: float):
+        # Record arrival time before anything else — this is used by
+        # start_collecting() to tell whether the stream is currently active.
+        # Written outside the lock; Python GIL makes the assignment atomic.
+        self._last_packet_wall_time = time.time()
+
         calibrated_mass = raw_value * self.calibration_factor
         tare_adjusted_mass = calibrated_mass - self.tare_offset
 
@@ -645,9 +745,14 @@ class SensorLink:
             if not self._collecting:
                 return
 
+            # Use wall-clock time so the axis is always real seconds.
+            # The firmware timestamp unit varies (ms, cs, etc.) between
+            # builds; wall clock is unambiguous and matches the playback
+            # loop timer used on the pump side.
+            wall_now = time.time()
             if self._time_offset is None:
-                self._time_offset = raw_time_s
-            t = raw_time_s - self._time_offset
+                self._time_offset = wall_now
+            t = wall_now - self._time_offset
             self._timestamps.append(t)
             self._masses.append(tare_adjusted_mass)
             self._raw_values.append(raw_value)
