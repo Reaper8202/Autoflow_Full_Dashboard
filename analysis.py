@@ -267,8 +267,9 @@ def compute_flow_from_mass(t, y, calibration_map):
 
     filt_inflow = lowpass_filter(inflow)
 
-    # Smooth over 4 seconds to cancel peristaltic pulsation regardless of
-    # actual sample rate. Must be odd and at least 3.
+    # KZ filter with a 4 s window to strongly smooth pump pulsation. This
+    # intentionally favors a cleaner trend line over preserving short
+    # transitions in the waveform.
     actual_fs = (n - 1) / (t[n - 1] - t[0]) if n >= 2 and t[n - 1] > t[0] else SAMPLING_RATE
     kz_win = max(3, int(4.0 * actual_fs))
     if kz_win % 2 == 0:

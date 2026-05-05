@@ -100,6 +100,16 @@ def _init():
         st.session_state.last_run_pdf = None
     if "last_run_pdf_for" not in st.session_state:
         st.session_state.last_run_pdf_for = None
+    if "fit_recording" not in st.session_state:
+        st.session_state.fit_recording = False
+    if "multi_cal_runs" not in st.session_state:
+        st.session_state.multi_cal_runs = []
+    if "capture_run_for_multi_fit" not in st.session_state:
+        st.session_state.capture_run_for_multi_fit = False
+    if "pending_multi_fit_run_name" not in st.session_state:
+        st.session_state.pending_multi_fit_run_name = None
+    if "last_multi_fit_capture_result" not in st.session_state:
+        st.session_state.last_multi_fit_capture_result = None
 
 
 # ── sidebar ────────────────────────────────────────────────────────────────
@@ -393,35 +403,68 @@ def page_sensor():
         else:
             st.info("No data yet. Press Start Collecting to begin.")
 
-        # Auto-refresh while collecting
-        if is_collecting:
+        # Auto-refresh while collecting — only rerun if calibration isn't active,
+        # otherwise the rerun fires before the Calibrate tab code executes and
+        # swallows every button press on that tab.
+        if is_collecting and not st.session_state.get("calibrating", False):
             time.sleep(0.5)
             st.rerun()
 
     # ── calibration workflow ───────────────────────────────────────────
     with tab_calib:
-        st.subheader("Calibration Workflow")
-        st.markdown("""
-        1. Place **250 mL of water** (250 g) on the sensor
-        2. Press **Start Calibration** — data will be collected for ~20 seconds
-        3. The system auto-stops when readings stabilize, or press **Stop**
-        4. A calibration map (mass → drain rate) is computed and saved
-        """)
+        st.subheader("Drain Rate Calibration")
+        cal_method = st.radio(
+            "Calibration method",
+            ["Fill then drain", "Drain open from start"],
+            horizontal=True,
+            key="cal_method",
+        )
+        target_start_mass_g = st.number_input(
+            "Target start mass (g)",
+            value=float(st.session_state.get("cal_target_start_mass_g", 250.0)),
+            min_value=10.0,
+            max_value=2000.0,
+            step=10.0,
+            key="cal_target_start_mass_g",
+        )
 
-        cc1, cc2, cc3 = st.columns(3)
+        if cal_method == "Fill then drain":
+            st.info(
+                "**Pump-only setup (no passive drain):** press **Set Zero Drain** — no calibration needed.\n\n"
+                "**Passive-drain setup:** fill the container, press **Start Calibration**, "
+                "then open the drain and let water flow out naturally. Press **Stop** when empty "
+                "or wait for the 60 s auto-stop."
+            )
+        else:
+            st.info(
+                "**Pump-only setup (no passive drain):** press **Set Zero Drain** — no calibration needed.\n\n"
+                "**Drain-open setup:** leave the drain open before you start. Press **Start Calibration**, "
+                f"pour until the container reaches about **{target_start_mass_g:.0f} g**, then stop pouring "
+                "and let it drain out naturally. Press **Stop** when empty or wait for the 60 s auto-stop."
+            )
+
+        cc1, cc2, cc3, cc4 = st.columns(4)
         cal_start = cc1.button("Start Calibration", use_container_width=True, disabled=not sensor.is_open())
         cal_stop = cc2.button("Stop Calibration", use_container_width=True)
         cal_save = cc3.button("Save Map to CSV", use_container_width=True)
+        cal_zero = cc4.button("Set Zero Drain", use_container_width=True)
+
+        if cal_zero:
+            st.session_state.calibration_map = [[], []]
+            st.success("Calibration set to zero drain — correct for pump-only setups.")
 
         if cal_start:
+            # Stop live graph loop so its st.rerun() doesn't preempt calibration
+            st.session_state["live_collecting"] = False
             sensor.start_collecting()
             st.session_state["calibrating"] = True
             st.session_state["cal_start_time"] = time.time()
+            st.session_state.pop("cal_result_msg", None)
 
         if cal_stop and st.session_state.get("calibrating"):
             sensor.stop_collecting()
             st.session_state["calibrating"] = False
-            _build_calibration_map()
+            _build_calibration_map(method=cal_method, target_start_mass_g=target_start_mass_g)
 
         is_calibrating = st.session_state.get("calibrating", False)
 
@@ -429,39 +472,413 @@ def page_sensor():
             elapsed = time.time() - st.session_state.get("cal_start_time", time.time())
             t_data, m_data, _ = sensor.get_data()
 
-            st.progress(min(1.0, elapsed / 20.0), text=f"Collecting... {elapsed:.1f}s ({len(t_data)} samples)")
+            # Determine what the mass is doing so we can guide the user
+            if len(m_data) >= 6:
+                recent_delta = m_data[-1] - m_data[-6]   # change over last ~3 samples
+            else:
+                recent_delta = 0.0
+
+            # Step guidance banner
+            if cal_method == "Drain open from start":
+                current_mass = float(m_data[-1]) if m_data else 0.0
+                remaining = float(target_start_mass_g) - current_mass
+                if elapsed < 2.0 or len(m_data) < 4:
+                    st.success("**Step 1 — Start pouring with the drain already open.**")
+                elif current_mass < float(target_start_mass_g) - 10.0:
+                    st.success(
+                        f"**Keep pouring** — current mass {current_mass:.1f} g, "
+                        f"target {target_start_mass_g:.0f} g ({remaining:.1f} g to go)."
+                    )
+                elif current_mass <= float(target_start_mass_g) + 10.0:
+                    st.info(
+                        f"**Target reached** — current mass {current_mass:.1f} g. "
+                        "Stop pouring and let it drain."
+                    )
+                elif recent_delta > 0.5:
+                    st.warning(
+                        f"**Above target** — current mass {current_mass:.1f} g. "
+                        "Stop pouring now and let it drain down."
+                    )
+                elif recent_delta < -0.5:
+                    st.info(f"**Drain detected ({recent_delta:.1f} g)** — let it keep draining.")
+                else:
+                    st.warning("**No mass change detected** — pour more or check that water is flowing.")
+            else:
+                if elapsed < 2.0 or len(m_data) < 4:
+                    st.success("**Step 1 — Start pouring water into the container now.**")
+                elif recent_delta > 0.5:
+                    st.success(f"**Filling detected (+{recent_delta:.1f} g) — keep pouring.**")
+                elif recent_delta < -0.5:
+                    st.info(f"**Drain detected ({recent_delta:.1f} g) — keep the drain open.**")
+                else:
+                    st.warning("**No mass change detected — is water flowing? Pour or open the drain.**")
+
+            mc1, mc2, mc3 = st.columns(3)
+            mc1.metric("Elapsed", f"{elapsed:.0f} s")
+            mc2.metric("Samples", len(t_data))
+            mc3.metric("Current mass", f"{m_data[-1]:.1f} g" if m_data else "—")
+
+            st.progress(min(1.0, elapsed / 60.0), text=f"Collecting... {elapsed:.0f}/60 s  (press Stop when done)")
 
             if t_data:
                 fig = go.Figure()
-                fig.add_trace(go.Scatter(x=t_data, y=m_data, name="Calibration Data", line=dict(color="#4CAF50", width=2)))
-                fig.update_layout(xaxis_title="Time (s)", yaxis_title="Mass (g)", height=300, margin=dict(t=30))
+                fig.add_trace(go.Scatter(x=t_data, y=m_data, name="Mass", line=dict(color="#4CAF50", width=2)))
+                fig.update_layout(xaxis_title="Time (s)", yaxis_title="Mass (g)", height=280, margin=dict(t=20))
                 st.plotly_chart(fig, use_container_width=True)
 
-            # Auto-stop: check stability (last 30 readings within 1g of each other)
-            if len(m_data) >= 40 and elapsed > 5:
-                recent = m_data[-30:]
-                spread = max(recent) - min(recent)
-                if spread < 1.0:
-                    sensor.stop_collecting()
-                    st.session_state["calibrating"] = False
-                    _build_calibration_map()
-                    st.success(f"Auto-stopped: readings stable (spread={spread:.2f}g)")
-                else:
-                    time.sleep(0.5)
-                    st.rerun()
-            elif is_calibrating:
-                # Safety timeout at 60s
-                if elapsed > 60:
-                    sensor.stop_collecting()
-                    st.session_state["calibrating"] = False
-                    _build_calibration_map()
-                    st.warning("Calibration timed out at 60s")
-                else:
-                    time.sleep(0.5)
-                    st.rerun()
+            # Auto-stop at 60 s only — the old stability-based stop was the bug:
+            # it fired immediately on a resting sensor, silently failed to build
+            # the map, and reset state before the user could see any feedback.
+            if elapsed >= 60.0:
+                sensor.stop_collecting()
+                st.session_state["calibrating"] = False
+                _build_calibration_map(method=cal_method, target_start_mass_g=target_start_mass_g)
+            else:
+                time.sleep(0.5)
+                st.rerun()
 
         if cal_save:
             _save_calibration_map_csv()
+
+        st.divider()
+        st.subheader("Generate Estimated Map")
+        st.caption(
+            "Use a reusable physics-shaped drain map when physical drain calibration is too noisy or impractical."
+        )
+        ec1, ec2, ec3, ec4 = st.columns(4)
+        est_max_mass_g = ec1.number_input(
+            "Reference mass (g)",
+            value=float(st.session_state.get("est_map_max_mass_g", 250.0)),
+            min_value=10.0,
+            max_value=2000.0,
+            step=10.0,
+            key="est_map_max_mass_g",
+            help="Max mass expected on sensor during runs. Set to typical peak mass.",
+        )
+        est_drain_rate = ec2.number_input(
+            "Drain rate at reference (g/s)",
+            value=float(st.session_state.get("est_map_drain_rate_g_s", -8.0)),
+            min_value=-100.0,
+            max_value=-0.01,
+            step=0.1,
+            format="%.2f",
+            key="est_map_drain_rate_g_s",
+            help="How fast water exits at reference mass. Must be negative.",
+        )
+        est_exponent = ec3.number_input(
+            "Physics exponent",
+            value=float(st.session_state.get("est_map_exponent", 0.5)),
+            min_value=0.1,
+            max_value=2.0,
+            step=0.05,
+            format="%.2f",
+            key="est_map_exponent",
+            help="0.5 = Torricelli/gravity drain. Increase for faster drain at low mass.",
+        )
+        est_threshold = ec4.number_input(
+            "Drain threshold (g)",
+            value=float(st.session_state.get("est_map_threshold_g", 0.0)),
+            min_value=0.0,
+            max_value=200.0,
+            step=5.0,
+            format="%.1f",
+            key="est_map_threshold_g",
+            help="Mass below which drain = 0. Raise this if small-volume tests over-estimate volume.",
+        )
+        if st.button("Generate Estimated Map", use_container_width=True, key="build_est_map"):
+            _build_estimated_calibration_map(est_max_mass_g, est_drain_rate, est_exponent, drain_threshold_g=est_threshold)
+
+        st.divider()
+        st.subheader("Fit Estimated Map From Known Volume")
+        st.caption(
+            "Record one full trusted run, including post-run drain-down, then fit a reusable estimated map to that trace."
+        )
+        fc1, fc2, fc3 = st.columns(3)
+        fit_expected_volume_ml = fc1.number_input(
+            "Known total volume (mL)",
+            value=float(st.session_state.get("fit_map_expected_volume_ml", 600.0)),
+            min_value=10.0,
+            max_value=5000.0,
+            step=10.0,
+            key="fit_map_expected_volume_ml",
+        )
+        fit_reference_mass_g = fc2.number_input(
+            "Fit reference mass (g)",
+            value=float(st.session_state.get("fit_map_reference_mass_g", 250.0)),
+            min_value=10.0,
+            max_value=2000.0,
+            step=10.0,
+            key="fit_map_reference_mass_g",
+        )
+        fit_tail_seconds = fc3.number_input(
+            "Required drained tail (s)",
+            value=float(st.session_state.get("fit_map_tail_seconds", 8.0)),
+            min_value=2.0,
+            max_value=300.0,
+            step=1.0,
+            key="fit_map_tail_seconds",
+        )
+        fit_source_label = None
+        fit_source_t = None
+        fit_source_q = None
+        fit_upload = st.file_uploader(
+            "Upload known-volume playback CSV",
+            type=["csv"],
+            key="fit_run_csv",
+        )
+        if fit_upload is not None:
+            try:
+                fit_upload_df = pd.read_csv(fit_upload)
+                fit_t_col = st.selectbox("Fit time column", fit_upload_df.columns, index=0, key="fit_t_col")
+                fit_q_col = st.selectbox(
+                    "Fit flow column",
+                    fit_upload_df.columns,
+                    index=min(1, len(fit_upload_df.columns) - 1),
+                    key="fit_q_col",
+                )
+                fit_source_label = fit_upload.name
+                fit_source_t = fit_upload_df[fit_t_col].to_numpy(dtype=float)
+                fit_source_q = fit_upload_df[fit_q_col].to_numpy(dtype=float)
+            except Exception as exc:
+                st.error(f"Could not parse fit CSV: {exc}")
+        else:
+            fit_profile_candidates = []
+            for candidate in sorted(Path(__file__).resolve().parent.glob("*.csv")):
+                if candidate.name.startswith("calibration_map_"):
+                    continue
+                fit_profile_candidates.append(candidate)
+            fit_profile_names = [p.name for p in fit_profile_candidates]
+            fit_profile_idx = 0
+            default_fit_profile = st.session_state.get("fit_profile_name", "")
+            if default_fit_profile in fit_profile_names:
+                fit_profile_idx = fit_profile_names.index(default_fit_profile)
+            fit_profile_name = st.selectbox(
+                "Or choose a local playback CSV",
+                fit_profile_names if fit_profile_names else ["No CSV profiles found"],
+                index=fit_profile_idx,
+                key="fit_profile_name",
+            )
+            fit_profile_path = next((p for p in fit_profile_candidates if p.name == fit_profile_name), None) if fit_profile_names else None
+            if fit_profile_path is not None:
+                try:
+                    fit_local_df = pd.read_csv(fit_profile_path)
+                    fit_t_col = _find_col(fit_local_df, ["time_s", "time"])
+                    fit_q_col = _find_col(fit_local_df, ["flow_ml_s", "flow"])
+                    if fit_t_col is not None and fit_q_col is not None:
+                        fit_source_label = fit_profile_path.name
+                        fit_source_t = fit_local_df[fit_t_col].to_numpy(dtype=float)
+                        fit_source_q = fit_local_df[fit_q_col].to_numpy(dtype=float)
+                except Exception:
+                    pass
+        fit_playback_speed = st.slider(
+            "Fit playback speed",
+            0.25,
+            4.0,
+            1.0,
+            0.25,
+            key="fit_playback_speed",
+        )
+        fit_can_start = (
+            st.session_state.link.is_open()
+            and sensor.is_open()
+            and fit_source_t is not None
+            and fit_source_q is not None
+        )
+        frc1, frc2 = st.columns(2)
+        if frc1.button(
+            "Start Fit Recording",
+            use_container_width=True,
+            disabled=not fit_can_start,
+            key="fit_record_start",
+        ):
+            st.session_state["live_collecting"] = False
+            st.session_state["calibrating"] = False
+            sensor.start_collecting()
+            st.session_state["fit_recording"] = True
+            st.session_state["fit_record_start_time"] = time.time()
+
+            try:
+                fit_source_q = np.clip(np.asarray(fit_source_q, dtype=float), 0.0, None)
+                fit_source_t = np.asarray(fit_source_t, dtype=float)
+                fit_effective_max_rpm = min(float(cfg.get("pump_max_rpm", PUMP_MAX_RPM)), float(PUMP_MAX_RPM))
+                fit_peak_rpm = float(np.max(fit_source_q)) / cfg["cal_factor"] if cfg["cal_factor"] > 0 and len(fit_source_q) else 0.0
+                fit_profile_scale = 1.0
+                if fit_peak_rpm > fit_effective_max_rpm + 1e-6 and fit_peak_rpm > 0:
+                    fit_profile_scale = fit_effective_max_rpm / fit_peak_rpm
+                fit_scaled_q = fit_source_q * fit_profile_scale
+                st.session_state["last_run_expected_volume"] = float(np.trapezoid(fit_scaled_q, fit_source_t)) / max(fit_playback_speed, 1e-6)
+                fit_source_duration = float(fit_source_t[-1] - fit_source_t[0]) if len(fit_source_t) > 1 else 0.0
+                st.session_state["last_run_source_duration"] = fit_source_duration / max(fit_playback_speed, 1e-6)
+                _run_exact(
+                    st.session_state.link,
+                    fit_source_t,
+                    fit_scaled_q,
+                    cfg["cal_factor"],
+                    fit_playback_speed,
+                    fit_effective_max_rpm,
+                    manage_sensor_collection=False,
+                    analyze_after=False,
+                    auto_tare=False,
+                )
+                if fit_source_label:
+                    st.info(
+                        f"Known-volume playback finished for {fit_source_label}. "
+                        "Leave recording running until drain-down is complete, then press Stop Fit Recording."
+                    )
+                else:
+                    st.info(
+                        "Known-volume playback finished. Leave recording running until drain-down is complete, "
+                        "then press Stop Fit Recording."
+                    )
+            except Exception as exc:
+                sensor.stop_collecting()
+                st.session_state["fit_recording"] = False
+                st.error(f"Calibration playback failed: {exc}")
+
+        if frc2.button("Stop Fit Recording", use_container_width=True, key="fit_record_stop"):
+            sensor.stop_collecting()
+            st.session_state["fit_recording"] = False
+
+        is_fit_recording = st.session_state.get("fit_recording", False)
+        if is_fit_recording:
+            elapsed = time.time() - st.session_state.get("fit_record_start_time", time.time())
+            fit_t_data, fit_m_data, _ = sensor.get_data()
+            st.caption(f"Fit recording in progress: {elapsed:.0f} s, {len(fit_t_data)} samples")
+            if fit_m_data:
+                st.metric("Current fit-recording mass", f"{fit_m_data[-1]:.1f} g")
+                if len(fit_m_data) >= 6:
+                    tail_delta = fit_m_data[-1] - fit_m_data[-6]
+                    if tail_delta < -0.5:
+                        st.info(f"Drain-down detected ({tail_delta:.1f} g over recent samples)")
+                    elif tail_delta > 0.5:
+                        st.info(f"Mass still increasing (+{tail_delta:.1f} g over recent samples)")
+                    else:
+                        st.info("Mass is relatively stable right now")
+
+            if fit_t_data and fit_m_data:
+                fit_fig = go.Figure()
+                fit_fig.add_trace(go.Scatter(x=fit_t_data, y=fit_m_data, name="Mass", line=dict(color="#009688", width=2)))
+                fit_fig.update_layout(xaxis_title="Time (s)", yaxis_title="Mass (g)", height=260, margin=dict(t=20))
+                st.plotly_chart(fit_fig, use_container_width=True)
+
+        if st.button("Fit Map From Current Recording", use_container_width=True, key="fit_est_map"):
+            _fit_estimated_calibration_map_from_recording(
+                expected_volume_ml=fit_expected_volume_ml,
+                reference_mass_g=fit_reference_mass_g,
+                required_tail_seconds=fit_tail_seconds,
+            )
+        if is_fit_recording:
+            time.sleep(0.5)
+            st.rerun()
+
+        # ── multi-run calibration ──────────────────────────────────────────
+        st.divider()
+        st.subheader("Multi-Run Calibration (Best Accuracy)")
+        st.caption(
+            "Upload sensor CSVs from runs at different known volumes (e.g. 100 mL, 400 mL, 600 mL). "
+            "The map is fit to minimize error across ALL volumes simultaneously — far more accurate "
+            "than single-run fitting, especially for small volumes."
+        )
+        st.session_state.setdefault("multi_cal_runs", [])
+        st.session_state.setdefault("run_queue", [])
+
+        mr_ref_mass = st.number_input(
+            "Reference mass (g)",
+            value=float(st.session_state.get("multi_cal_ref_mass", 250.0)),
+            min_value=10.0, max_value=2000.0, step=10.0,
+            key="multi_cal_ref_mass",
+            help="Set to the largest typical peak mass you expect on the sensor across all runs.",
+        )
+
+        st.markdown("**1. Queue playback CSVs to record sensor traces**")
+        multi_playback_uploads = st.file_uploader(
+            "Upload playback CSVs to add to the automated test queue",
+            type=["csv"],
+            accept_multiple_files=True,
+            key="multi_cal_playback_uploads",
+        )
+        mp1, mp2 = st.columns(2)
+        if mp1.button("Add Playback CSVs To Run Queue", key="multi_add_to_queue", use_container_width=True):
+            if not multi_playback_uploads:
+                st.warning("Upload at least one playback CSV first.")
+            else:
+                existing_names = {item["name"] for item in st.session_state["run_queue"]}
+                added = 0
+                for queue_file in multi_playback_uploads:
+                    if queue_file.name in existing_names:
+                        continue
+                    try:
+                        queue_df = pd.read_csv(queue_file)
+                        queue_t_col = _find_col(queue_df, ["time_s", "time"])
+                        queue_q_col = _find_col(queue_df, ["flow_ml_s", "flow"])
+                        if queue_t_col is None or queue_q_col is None:
+                            st.warning(f"{queue_file.name}: missing time_s and flow_ml_s columns")
+                            continue
+                        queue_df = queue_df.rename(columns={queue_t_col: "time_s", queue_q_col: "flow_ml_s"})
+                        st.session_state["run_queue"].append({"name": queue_file.name, "df": queue_df})
+                        existing_names.add(queue_file.name)
+                        added += 1
+                    except Exception as exc:
+                        st.warning(f"{queue_file.name}: parse error: {exc}")
+                st.success(f"Added {added} playback CSV(s) to the Run Automated Test queue.")
+        if mp2.button("Load Queue Result CSVs Here", key="multi_load_queue_results", use_container_width=True):
+            queue_results = st.session_state.get("queue_all_results", [])
+            loaded = 0
+            for res in queue_results:
+                csv_bytes = res.get("csv")
+                if not csv_bytes:
+                    continue
+                try:
+                    csv_text = csv_bytes.decode(errors="replace")
+                    expected_ml = _expected_volume_from_csv_text(csv_text)
+                    df_up = pd.read_csv(io.StringIO(csv_text), comment="#")
+                    _append_multi_cal_run(res["name"], df_up, expected_ml=expected_ml)
+                    loaded += 1
+                except Exception as exc:
+                    st.warning(f"{res.get('name', 'queue result')}: could not load result CSV ({exc})")
+            if loaded:
+                st.success(f"Loaded {loaded} queue result CSV(s) into multi-run calibration.")
+            else:
+                st.warning("No queue result CSVs were available to load.")
+        if st.session_state["run_queue"]:
+            st.caption(f"Queued playback files available on Run Automated Test page: {len(st.session_state['run_queue'])}")
+
+        st.markdown("**2. Upload sensor recording/result CSVs for fitting**")
+
+        multi_uploads = st.file_uploader(
+            "Upload sensor recording CSVs (one per test volume)",
+            type=["csv"], accept_multiple_files=True, key="multi_cal_uploads"
+        )
+        if multi_uploads:
+            for uf in multi_uploads:
+                try:
+                    csv_text = uf.read().decode(errors="replace")
+                    expected_ml = _expected_volume_from_csv_text(csv_text)
+                    df_up = pd.read_csv(io.StringIO(csv_text), comment="#")
+                    _append_multi_cal_run(uf.name, df_up, expected_ml=expected_ml)
+                except Exception as exc:
+                    st.warning(f"Could not parse {uf.name}: {exc}")
+
+        if st.session_state["multi_cal_runs"]:
+            st.markdown("**Set expected volume for each run:**")
+            for i, run in enumerate(st.session_state["multi_cal_runs"]):
+                mc1, mc2 = st.columns([3, 1])
+                mc1.text(run["name"])
+                run["expected_ml"] = mc2.number_input(
+                    "mL", value=float(run["expected_ml"]) or 400.0,
+                    min_value=1.0, max_value=5000.0, step=10.0,
+                    key=f"multi_cal_vol_{i}_{run['name']}",
+                    label_visibility="collapsed",
+                )
+            mcc1, mcc2 = st.columns(2)
+            if mcc1.button("Clear Runs", key="multi_cal_clear"):
+                st.session_state["multi_cal_runs"] = []
+                st.rerun()
+            if mcc2.button("Fit Multi-Run Map", type="primary", key="fit_multi_run_map",
+                           disabled=len(st.session_state["multi_cal_runs"]) < 2):
+                _fit_multi_run_calibration_map(st.session_state["multi_cal_runs"], mr_ref_mass)
+        else:
+            st.info("Upload at least 2 sensor recordings to enable multi-run fitting.")
 
         # Load calibration from CSV
         st.divider()
@@ -516,50 +933,362 @@ def page_sensor():
             st.info("No calibration map loaded. Calibrate the sensor or load from CSV.")
 
 
-def _build_calibration_map():
-    """Build a calibration map from the most recent sensor data."""
+def _build_calibration_map(method="Fill then drain", target_start_mass_g=None):
+    """Build drain-rate lookup table from a fill-then-drain mass signal.
+
+    Matches the Flutter app: produces a [masses, drain_rates] map sorted by
+    descending mass so _corresponding_drain_rate() can look up the passive
+    outflow rate at any given fill level.  Drain rates are stored as negative
+    values (mass leaving the container) consistent with the Flutter convention.
+    """
     sensor = st.session_state.sensor
     t_data, m_data, _ = sensor.get_data()
     if len(t_data) < 20:
-        st.warning("Not enough data to build calibration map (need at least 20 samples)")
+        st.error("Not enough data (need at least 20 samples). Run calibration for longer.")
         return
 
-    t = np.array(t_data)
-    y = np.array(m_data)
+    t = np.array(t_data, dtype=float)
+    y = np.array(m_data, dtype=float)
 
     from analysis import lowpass_filter, get_derivative
 
-    # Low-pass filter the mass
     filt_mass = lowpass_filter(y)
 
-    # Find the peak, then look at the descending portion
+    total_drop = float(filt_mass.max() - filt_mass.min())
+    if total_drop < 10.0:
+        st.error(
+            f"Mass only changed {total_drop:.1f} g — no significant drain detected. "
+            "For pump-only setups with no passive drain press **Set Zero Drain** instead."
+        )
+        return
+
+    # Both calibration methods ultimately need the pure post-pour drain segment.
+    # In "Drain open from start" mode the user pours up to a target mass with the
+    # drain already open, so the local peak still marks the handoff from fill to
+    # passive drain even though there was never a plugged hold phase.
     max_idx = int(np.argmax(filt_mass))
-    max_idx = min(max_idx + 20, len(filt_mass) - 2)  # +20 samples offset
+    max_idx = min(max_idx + 20, len(filt_mass) - 2)
 
-    if max_idx >= len(filt_mass) - 1:
-        max_idx = len(filt_mass) - 2
+    if method == "Drain open from start" and target_start_mass_g is not None:
+        peak_mass = float(filt_mass[int(np.argmax(filt_mass))])
+        if peak_mass < float(target_start_mass_g) * 0.60:
+            st.warning(
+                f"Observed peak mass was only {peak_mass:.1f} g against a target of "
+                f"{float(target_start_mass_g):.0f} g. The calibration map was built from the "
+                "available drain segment, but the target was not reached."
+            )
 
-    # Find min after peak
     search_end = len(filt_mass) - 1
     if max_idx >= search_end:
-        st.warning("Could not find descending portion for calibration")
+        st.error("Peak is at the very end of the recording — stop pouring earlier and let it drain for several seconds.")
         return
 
     min_idx = max_idx + int(np.argmin(filt_mass[max_idx:search_end]))
-    if min_idx <= max_idx:
-        st.warning("No proper descending portion found")
+    if min_idx <= max_idx + 5:
+        st.error("Drain window too short. Let water drain for several seconds before pressing Stop.")
         return
 
-    # Derivative and filter
     deriv = get_derivative(t, filt_mass, ss=2)
     filt_rate = lowpass_filter(deriv)
 
-    # Extract the windowed portion
+    # Store the full windowed segment — matches Flutter which keeps every sample
+    # rather than binning.  The lookup in _corresponding_drain_rate is O(n) but
+    # n is small enough (a few hundred points) that this is not a concern.
     cal_masses = filt_mass[max_idx:min_idx].tolist()
-    cal_rates = filt_rate[max_idx:min_idx].tolist()
+    cal_rates  = filt_rate[max_idx:min_idx].tolist()
+
+    # Sort descending by mass (high fill → low fill) — required by _corresponding_drain_rate
+    pairs = sorted(zip(cal_masses, cal_rates), key=lambda x: x[0], reverse=True)
+    cal_masses = [p[0] for p in pairs]
+    cal_rates  = [p[1] for p in pairs]
 
     st.session_state.calibration_map = [cal_masses, cal_rates]
-    st.success(f"Calibration map built with {len(cal_masses)} points")
+    st.success(
+        f"Lookup table built: {len(cal_masses)} points, "
+        f"mass range {min(cal_masses):.1f}–{max(cal_masses):.1f} g, "
+        f"drain rate {min(cal_rates):.4f}–{max(cal_rates):.4f} g/s"
+    )
+
+
+def _build_estimated_calibration_map(reference_mass_g, drain_rate_at_reference_g_s, exponent=0.5, points=120, drain_threshold_g=0.0):
+    """Build a reusable drain map from a simple gravity-style drain model.
+
+    drain_threshold_g: mass below which drain is considered zero (low head / drain hole
+    above container floor). Improves accuracy for small-volume tests where mass barely
+    exceeds the threshold during the run.
+    """
+    reference_mass_g = float(reference_mass_g)
+    drain_rate_at_reference_g_s = float(drain_rate_at_reference_g_s)
+    exponent = float(exponent)
+    drain_threshold_g = float(drain_threshold_g)
+    if reference_mass_g <= drain_threshold_g:
+        st.error("Reference mass must be greater than drain threshold.")
+        return
+    if drain_rate_at_reference_g_s >= 0:
+        st.error("Drain rate at reference mass must be negative.")
+        return
+    if exponent <= 0:
+        st.error("Exponent must be positive.")
+        return
+
+    masses, rates = _estimated_map_arrays(reference_mass_g, drain_rate_at_reference_g_s, exponent, points, drain_threshold_g)
+    st.session_state.calibration_map = [masses.tolist(), rates.tolist()]
+    st.success(
+        f"Estimated lookup table built: {len(masses)} points, "
+        f"reference {reference_mass_g:.1f} g @ {drain_rate_at_reference_g_s:.2f} g/s, "
+        f"exponent {exponent:.2f}, threshold {drain_threshold_g:.1f} g"
+    )
+
+
+def _estimated_map_arrays(reference_mass_g, drain_rate_at_reference_g_s, exponent=0.5, points=120, drain_threshold_g=0.0):
+    ref = float(reference_mass_g)
+    thresh = float(drain_threshold_g)
+    rate_ref = float(drain_rate_at_reference_g_s)
+    masses = np.linspace(ref, 0.0, int(points))
+    span = max(ref - thresh, 1e-9)
+    frac = np.clip((masses - thresh) / span, 0.0, None)
+    rates = np.where(masses > thresh, rate_ref * (frac ** float(exponent)), 0.0)
+    return masses, rates.astype(float)
+
+
+def _fit_estimated_calibration_map_from_recording(expected_volume_ml, reference_mass_g, required_tail_seconds=8.0):
+    sensor = st.session_state.sensor
+    t_data, m_data, _ = sensor.get_data()
+    if len(t_data) < 40:
+        st.error("Not enough recorded data to fit a map. Record a full run first.")
+        return
+
+    t = np.asarray(t_data, dtype=float)
+    y = np.asarray(m_data, dtype=float)
+    duration = float(t[-1] - t[0]) if len(t) > 1 else 0.0
+    if duration < max(10.0, float(required_tail_seconds) + 2.0):
+        st.error("Recording is too short. Capture the full run plus several seconds of drain-down.")
+        return
+
+    from analysis import lowpass_filter, get_derivative
+
+    filt_mass = lowpass_filter(y)
+    deriv = get_derivative(t, filt_mass, ss=2)
+    filt_mass_rate = lowpass_filter(deriv)
+
+    tail_mask = t >= (t[-1] - float(required_tail_seconds))
+    if np.mean(filt_mass[tail_mask]) > max(10.0, 0.15 * float(reference_mass_g)):
+        st.warning(
+            "The recording tail still has substantial mass on the sensor. "
+            "Fit may be poor unless you stop after it has mostly drained out."
+        )
+
+    ref_mass = float(reference_mass_g)
+    if ref_mass <= 0:
+        st.error("Reference mass must be positive.")
+        return
+
+    # Grid search over (rate, exponent, threshold). Volume matching is primary;
+    # tail inflow penalty keeps drain from being over-subtracted after the run ends.
+    exponent_grid = np.linspace(0.25, 1.5, 26)
+    rate_grid = np.linspace(-25.0, -0.3, 249)
+    threshold_grid = [0.0, 5.0, 10.0, 15.0, 20.0, 30.0, 40.0]
+
+    drain_mask = (filt_mass > 5.0) & (filt_mass_rate < -0.1)
+    best = None
+    best_payload = None
+
+    progress_bar = st.progress(0.0, text="Fitting calibration map...")
+    total = len(threshold_grid) * len(exponent_grid) * len(rate_grid)
+    step = 0
+
+    for thresh in threshold_grid:
+        if ref_mass <= thresh:
+            continue
+        span = ref_mass - thresh
+        for exponent in exponent_grid:
+            for rate_ref in rate_grid:
+                step += 1
+                if step % 2000 == 0:
+                    progress_bar.progress(min(step / total, 1.0), text=f"Fitting… {step}/{total}")
+
+                frac = np.clip((filt_mass - thresh) / span, 0.0, None)
+                drain_curve = np.where(filt_mass > thresh, rate_ref * (frac ** exponent), 0.0)
+                inflow = np.maximum(0.0, filt_mass_rate - drain_curve)
+
+                total_ml = float(np.trapezoid(inflow, t)) / 0.9982
+                vol_err = abs(total_ml - float(expected_volume_ml)) / max(float(expected_volume_ml), 1e-6)
+                tail_inflow_penalty = float(np.mean(inflow[tail_mask])) if np.any(tail_mask) else 0.0
+                drain_shape_penalty = 0.0
+                if np.any(drain_mask):
+                    drain_shape_penalty = float(np.mean((drain_curve[drain_mask] - filt_mass_rate[drain_mask]) ** 2))
+
+                score = (6.0 * vol_err) + (0.15 * tail_inflow_penalty) + (0.02 * drain_shape_penalty)
+                if best is None or score < best:
+                    best = score
+                    best_payload = {
+                        "rate_ref": float(rate_ref),
+                        "exponent": float(exponent),
+                        "threshold": float(thresh),
+                        "total_ml": total_ml,
+                        "vol_err_pct": vol_err * 100.0,
+                    }
+
+    progress_bar.progress(1.0, text="Done.")
+
+    if best_payload is None:
+        st.error("Could not fit an estimated map from this recording.")
+        return
+
+    masses, rates = _estimated_map_arrays(ref_mass, best_payload["rate_ref"], best_payload["exponent"], drain_threshold_g=best_payload["threshold"])
+    st.session_state.calibration_map = [masses.tolist(), rates.tolist()]
+    st.success(
+        "Estimated map fitted from recording: "
+        f"drain @ {ref_mass:.0f} g = {best_payload['rate_ref']:.2f} g/s, "
+        f"exponent = {best_payload['exponent']:.2f}, "
+        f"threshold = {best_payload['threshold']:.0f} g, "
+        f"predicted volume = {best_payload['total_ml']:.1f} mL "
+        f"({best_payload['vol_err_pct']:.1f}% error)"
+    )
+
+
+def _expected_volume_from_csv_text(text):
+    first_line = text.splitlines()[0].strip() if text.splitlines() else ""
+    if not first_line.startswith("#"):
+        return 0.0
+    for part in first_line[1:].split(","):
+        part = part.strip()
+        if part.startswith("expected_volume_mL="):
+            try:
+                return float(part.split("=", 1)[1])
+            except ValueError:
+                return 0.0
+    return 0.0
+
+
+def _append_multi_cal_run(name, df_up, expected_ml=0.0):
+    t_col = "time_s" if "time_s" in df_up.columns else df_up.columns[0]
+    m_col = "mass_g" if "mass_g" in df_up.columns else df_up.columns[1]
+    if any(r["name"] == name for r in st.session_state["multi_cal_runs"]):
+        return
+    st.session_state["multi_cal_runs"].append({
+        "name": name,
+        "t": df_up[t_col].to_numpy(dtype=float),
+        "m": df_up[m_col].to_numpy(dtype=float),
+        "expected_ml": float(expected_ml),
+    })
+
+
+def _append_multi_cal_run_from_csv_bytes(name, csv_bytes):
+    if not csv_bytes:
+        return False, "No CSV data available."
+    try:
+        csv_text = csv_bytes.decode(errors="replace")
+        expected_ml = _expected_volume_from_csv_text(csv_text)
+        df_up = pd.read_csv(io.StringIO(csv_text), comment="#")
+        _append_multi_cal_run(name, df_up, expected_ml=expected_ml)
+        return True, expected_ml
+    except Exception as exc:
+        return False, str(exc)
+
+
+def _fit_multi_run_calibration_map(runs, reference_mass_g):
+    """Fit drain map parameters jointly across multiple known-volume runs.
+
+    runs: list of {"name": str, "t": np.ndarray, "m": np.ndarray, "expected_ml": float}
+    Searches (rate_ref, exponent, threshold) to minimise aggregate volume error.
+    """
+    from analysis import lowpass_filter, get_derivative
+
+    ref_mass = float(reference_mass_g)
+    if ref_mass <= 0:
+        st.error("Reference mass must be positive.")
+        return
+
+    # Preprocess each run once
+    processed = []
+    for run in runs:
+        t = np.asarray(run["t"], dtype=float)
+        m = np.asarray(run["m"], dtype=float)
+        if len(t) < 20:
+            st.warning(f"Run '{run['name']}' has too few samples — skipped.")
+            continue
+        fm = lowpass_filter(m)
+        fmr = lowpass_filter(get_derivative(t, fm, ss=2))
+        tail_mask = t >= (t[-1] - 8.0)
+        processed.append({
+            "name": run["name"],
+            "t": t,
+            "fm": fm,
+            "fmr": fmr,
+            "tail_mask": tail_mask,
+            "expected_ml": float(run["expected_ml"]),
+        })
+
+    if not processed:
+        st.error("No valid runs to fit.")
+        return
+
+    exponent_grid = np.linspace(0.25, 1.5, 26)
+    rate_grid = np.linspace(-25.0, -0.3, 249)
+    threshold_grid = [0.0, 5.0, 10.0, 15.0, 20.0, 30.0, 40.0]
+
+    best_score = None
+    best_payload = None
+    total = len(threshold_grid) * len(exponent_grid) * len(rate_grid)
+    prog = st.progress(0.0, text="Fitting multi-run calibration map…")
+    step = 0
+
+    for thresh in threshold_grid:
+        if ref_mass <= thresh:
+            continue
+        span = ref_mass - thresh
+        for exponent in exponent_grid:
+            for rate_ref in rate_grid:
+                step += 1
+                if step % 2000 == 0:
+                    prog.progress(min(step / total, 1.0), text=f"Fitting… {step}/{total}")
+
+                total_vol_err = 0.0
+                tail_pen = 0.0
+                per_run_ml = []
+                for r in processed:
+                    frac = np.clip((r["fm"] - thresh) / span, 0.0, None)
+                    dc = np.where(r["fm"] > thresh, rate_ref * (frac ** exponent), 0.0)
+                    inflow = np.maximum(0.0, r["fmr"] - dc)
+                    vol_ml = float(np.trapezoid(inflow, r["t"])) / 0.9982
+                    per_run_ml.append(vol_ml)
+                    total_vol_err += abs(vol_ml - r["expected_ml"]) / max(r["expected_ml"], 1e-6)
+                    if np.any(r["tail_mask"]):
+                        tail_pen += float(np.mean(inflow[r["tail_mask"]]))
+
+                avg_err = total_vol_err / len(processed)
+                score = (6.0 * avg_err) + (0.1 * tail_pen / len(processed))
+                if best_score is None or score < best_score:
+                    best_score = score
+                    best_payload = {
+                        "rate_ref": float(rate_ref),
+                        "exponent": float(exponent),
+                        "threshold": float(thresh),
+                        "per_run_ml": per_run_ml,
+                    }
+
+    prog.progress(1.0, text="Done.")
+    if best_payload is None:
+        st.error("Could not fit a map.")
+        return
+
+    masses, rates = _estimated_map_arrays(
+        ref_mass, best_payload["rate_ref"], best_payload["exponent"],
+        drain_threshold_g=best_payload["threshold"]
+    )
+    st.session_state.calibration_map = [masses.tolist(), rates.tolist()]
+
+    lines = []
+    for r, ml in zip(processed, best_payload["per_run_ml"]):
+        err_pct = abs(ml - r["expected_ml"]) / max(r["expected_ml"], 1e-6) * 100.0
+        lines.append(f"- **{r['name']}**: predicted {ml:.1f} mL vs {r['expected_ml']:.0f} mL → {err_pct:.1f}% error")
+    st.success(
+        f"Multi-run map fitted: drain @ {ref_mass:.0f} g = {best_payload['rate_ref']:.2f} g/s, "
+        f"exponent = {best_payload['exponent']:.2f}, threshold = {best_payload['threshold']:.0f} g"
+    )
+    for line in lines:
+        st.markdown(line)
 
 
 def _save_calibration_map_csv():
@@ -858,12 +1587,55 @@ def _find_col(df, candidates):
 #  PAGE 2 — RUN TEST
 # ══════════════════════════════════════════════════════════════════════════
 
+# INSERT _wait_for_drain FUNCTION HERE: used by the run queue between tests.
+def _wait_for_drain(sensor, timeout_s=120, threshold_g=15, stable_s=8):
+    """Wait until live mass remains below threshold for a stable interval."""
+    progress = st.progress(0.0, text="Waiting for drain...")
+    status = st.empty()
+    start = time.time()
+    stable_start = None
+
+    while True:
+        elapsed = time.time() - start
+        mass = float(sensor.current_reading)
+
+        if mass < threshold_g:
+            if stable_start is None:
+                stable_start = time.time()
+            stable_elapsed = time.time() - stable_start
+        else:
+            stable_start = None
+            stable_elapsed = 0.0
+
+        progress.progress(
+            min(1.0, elapsed / max(timeout_s, 1e-6)),
+            text=f"Waiting for drain: {mass:.1f} g, stable {stable_elapsed:.1f}/{stable_s:.1f}s",
+        )
+        status.info(
+            f"Waiting for drain below {threshold_g:.1f} g "
+            f"({stable_elapsed:.1f}/{stable_s:.1f}s stable, {elapsed:.1f}/{timeout_s:.1f}s elapsed)"
+        )
+
+        if stable_elapsed >= stable_s:
+            progress.progress(1.0, text="Drain complete")
+            status.success("Drain complete")
+            return True
+        if elapsed >= timeout_s:
+            progress.empty()
+            status.warning("Drain wait timed out")
+            return False
+
+        time.sleep(0.5)
+
+
 def page_run():
     st.header("Run Automated Test")
 
     cfg = st.session_state.cfg
     link = st.session_state.link
     sensor = st.session_state.sensor
+    if "pump_link" not in st.session_state:
+        st.session_state.pump_link = link
 
     if not link.is_open():
         st.warning("Connect to the pump in the sidebar first.")
@@ -873,6 +1645,7 @@ def page_run():
 
     source_t = None
     source_q = None
+    source_name = None
 
     if source == "Upload CSV curve":
         f = st.file_uploader("CSV with columns: time_s, flow_ml_s", type=["csv"], key="run_csv")
@@ -883,6 +1656,7 @@ def page_run():
                 q_col = st.selectbox("Flow column", df.columns, index=min(1, len(df.columns) - 1))
                 source_t = df[t_col].to_numpy(dtype=float)
                 source_q = df[q_col].to_numpy(dtype=float)
+                source_name = f.name
             except Exception as e:
                 st.error(f"Parse error: {e}")
     else:
@@ -904,6 +1678,135 @@ def page_run():
         else:
             source_t = np.asarray(profile["u"], dtype=float) * duration
             source_q = np.asarray(profile["q"], dtype=float)
+            source_name = f"{shape}_{int(round(volume))}mL_{int(round(duration))}s.csv"
+
+    with st.expander("Test Queue"):
+        st.session_state.setdefault("run_queue", [])
+        st.session_state.setdefault("run_queue_upload_rev", 0)
+
+        # Key rotates on Clear so the uploader widget resets and doesn't re-add files
+        queue_files = st.file_uploader(
+            "Queue CSV files with columns: time_s, flow_ml_s",
+            type=["csv"],
+            accept_multiple_files=True,
+            key=f"run_queue_csvs_{st.session_state['run_queue_upload_rev']}",
+        )
+        if queue_files:
+            existing_names = {item["name"] for item in st.session_state["run_queue"]}
+            for queue_file in queue_files:
+                if queue_file.name in existing_names:
+                    continue
+                try:
+                    queue_df = pd.read_csv(queue_file)
+                    queue_t_col = _find_col(queue_df, ["time_s", "time"])
+                    queue_q_col = _find_col(queue_df, ["flow_ml_s", "flow"])
+                    if queue_t_col is None or queue_q_col is None:
+                        st.error(f"{queue_file.name}: missing time_s and flow_ml_s columns")
+                        continue
+                    queue_df = queue_df.rename(columns={queue_t_col: "time_s", queue_q_col: "flow_ml_s"})
+                    st.session_state["run_queue"].append({"name": queue_file.name, "df": queue_df})
+                    existing_names.add(queue_file.name)
+                except Exception as e:
+                    st.error(f"{queue_file.name}: parse error: {e}")
+
+        if st.session_state["run_queue"]:
+            for i, item in enumerate(st.session_state["run_queue"]):
+                row = st.columns([0.08, 0.66, 0.13, 0.13])
+                row[0].write(f"{i + 1}.")
+                row[1].write(item["name"])
+                if row[2].button("Up", key=f"run_queue_up_{i}", disabled=i == 0):
+                    st.session_state["run_queue"][i - 1], st.session_state["run_queue"][i] = (
+                        st.session_state["run_queue"][i],
+                        st.session_state["run_queue"][i - 1],
+                    )
+                    st.rerun()
+                if row[3].button("Down", key=f"run_queue_down_{i}", disabled=i == len(st.session_state["run_queue"]) - 1):
+                    st.session_state["run_queue"][i + 1], st.session_state["run_queue"][i] = (
+                        st.session_state["run_queue"][i],
+                        st.session_state["run_queue"][i + 1],
+                    )
+                    st.rerun()
+        else:
+            st.info("Queue is empty")
+
+        speed = st.slider("Queue playback speed", 0.25, 4.0, 1.0, 0.25, key="run_queue_speed")
+        qc1, qc2 = st.columns(2)
+        if qc1.button("Clear Queue", use_container_width=True):
+            st.session_state["run_queue"] = []
+            st.session_state["queue_all_results"] = []
+            st.session_state["run_queue_upload_rev"] += 1  # resets file uploader widget
+            st.rerun()
+
+        effective_max_rpm = min(float(cfg.get("pump_max_rpm", PUMP_MAX_RPM)), float(PUMP_MAX_RPM))
+        pump_ready = st.session_state.pump_link.is_open()
+        _age = sensor.last_packet_age
+        sensor_ready = sensor.is_open() and _age is not None and _age < 3.0
+        run_queue_disabled = not pump_ready or not sensor_ready or not st.session_state["run_queue"]
+        if qc2.button("Run Queue", type="primary", use_container_width=True, disabled=run_queue_disabled):
+            link = st.session_state.pump_link
+            sensor = st.session_state.sensor
+            cfg = st.session_state.cfg
+            total = len(st.session_state["run_queue"])
+            queue_all_results = list(st.session_state.get("queue_all_results", []))
+            for idx, item in enumerate(st.session_state["run_queue"], start=1):
+                st.info(f"Running test {idx} of {total}: {item['name']}")
+                try:
+                    queue_source_t = item["df"]["time_s"].to_numpy(dtype=float)
+                    queue_source_q = np.clip(item["df"]["flow_ml_s"].to_numpy(dtype=float), 0.0, None)
+                    queue_peak_rpm = float(np.max(queue_source_q)) / cfg["cal_factor"] if cfg["cal_factor"] > 0 and len(queue_source_q) else 0.0
+                    queue_profile_scale = 1.0
+                    if queue_peak_rpm > effective_max_rpm + 1e-6 and queue_peak_rpm > 0:
+                        queue_profile_scale = effective_max_rpm / queue_peak_rpm
+                    queue_scaled_q = queue_source_q * queue_profile_scale
+                    queue_source_duration = float(queue_source_t[-1] - queue_source_t[0]) if len(queue_source_t) > 1 else 0.0
+                    st.session_state["last_run_expected_volume"] = float(np.trapezoid(queue_scaled_q, queue_source_t)) / max(speed, 1e-6)
+                    st.session_state["last_run_source_duration"] = queue_source_duration / max(speed, 1e-6)
+                    # Clear stale CSV so a failed run never poisons the result list
+                    st.session_state["last_run_csv"] = None
+                    st.session_state["pending_multi_fit_run_name"] = (
+                        item["name"] if st.session_state.get("capture_run_for_multi_fit") else None
+                    )
+                    # _run_exact already calls _display_sensor_analysis internally
+                    _run_exact(link, queue_source_t, queue_scaled_q, cfg["cal_factor"], speed, effective_max_rpm)
+                    # Collect result only if analysis succeeded
+                    if st.session_state.get("run_analysis_status") == "Graphs ready":
+                        run_csv = st.session_state.get("last_run_csv")
+                        if run_csv:
+                            queue_all_results.append({"name": item["name"], "csv": run_csv})
+                    # Persist incrementally so partial results survive an abort
+                    st.session_state["queue_all_results"] = queue_all_results
+                except Exception as exc:
+                    st.error(f"Test {idx} ({item['name']}) failed: {exc}")
+                    queue_all_results.append({"name": item["name"], "csv": None, "error": str(exc)})
+                    st.session_state["queue_all_results"] = queue_all_results
+                if idx < total:
+                    if not _wait_for_drain(sensor):
+                        st.error("Drain timeout — queue stopped after test {idx}.")
+                        break
+            st.success(f"Queue complete — {len(queue_all_results)} of {total} runs finished.")
+
+        # Show per-run download buttons if queue results are available
+        if st.session_state.get("queue_all_results"):
+            st.subheader("Queue Results")
+            for res in st.session_state["queue_all_results"]:
+                ts = int(time.time())
+                qr1, qr2 = st.columns([2, 1])
+                qr1.download_button(
+                    f"Download {res['name']} results",
+                    data=res["csv"],
+                    file_name=res["name"].replace(".csv", f"_results_{ts}.csv"),
+                    mime="text/csv",
+                    key=f"qres_{res['name']}_{ts}",
+                )
+                if qr2.button(f"Add {res['name']} To Multi-Run Fit", key=f"add_qres_multi_{res['name']}_{ts}", use_container_width=True):
+                    ok, payload = _append_multi_cal_run_from_csv_bytes(res["name"], res.get("csv"))
+                    if ok:
+                        st.success(
+                            f"Added {res['name']} to multi-run calibration"
+                            + (f" ({payload:.0f} mL expected)." if payload else ".")
+                        )
+                    else:
+                        st.error(f"Could not add {res['name']} to multi-run calibration: {payload}")
 
     if source_t is None or source_q is None:
         return
@@ -913,6 +1816,21 @@ def page_run():
 
     # ── settings ───────────────────────────────────────────────────────
     st.divider()
+
+    st.checkbox(
+        "Auto-save finished runs to Multi-Run Calibration",
+        key="capture_run_for_multi_fit",
+        help="When enabled, each successful run is saved directly into the multi-run calibration dataset.",
+    )
+    capture_result = st.session_state.get("last_multi_fit_capture_result")
+    if capture_result:
+        if capture_result["ok"]:
+            st.caption(
+                f"Most recent fit capture: {capture_result['name']}"
+                + (f" ({capture_result['payload']:.0f} mL expected)." if capture_result["payload"] else ".")
+            )
+        else:
+            st.caption(f"Most recent fit capture failed: {capture_result['name']} ({capture_result['payload']})")
 
     c1, c2 = st.columns(2)
     with c1:
@@ -1012,6 +1930,9 @@ def page_run():
         st.session_state["last_run_expected_volume"] = scaled_volume / max(speed, 1e-6)
         # Playback wall-clock duration — used to fix the overlay X-axis range
         st.session_state["last_run_source_duration"] = source_duration / max(speed, 1e-6)
+        st.session_state["pending_multi_fit_run_name"] = (
+            source_name or f"run_{int(time.time())}.csv"
+        ) if st.session_state.get("capture_run_for_multi_fit") else None
         if mode == "Exact playback":
             _run_exact(link, source_t, scaled_q, cfg["cal_factor"], speed, effective_max_rpm)
         else:
@@ -1026,10 +1947,25 @@ def page_run():
         st.divider()
         st.subheader("Last Automated Test Results")
         st.caption("These are the most recently captured sensor-analysis graphs from the automated test page.")
+        add_last_fit_col, _ = st.columns([1, 3])
+        with add_last_fit_col:
+            if st.button("Add Last Run To Multi-Run Fit", key="add_last_run_multi_fit", use_container_width=True):
+                run_name = f"last_run_{int(saved_results.get('saved_at', 0))}.csv"
+                ok, payload = _append_multi_cal_run_from_csv_bytes(
+                    run_name,
+                    st.session_state.get("last_run_csv"),
+                )
+                if ok:
+                    st.success(
+                        f"Added last run to multi-run calibration"
+                        + (f" ({payload:.0f} mL expected)." if payload else ".")
+                    )
+                else:
+                    st.error(f"Could not add last run to multi-run calibration: {payload}")
         _render_saved_run_analysis(saved_results)
 
 
-def _run_exact(link, t, q, cal_factor, speed_mult, max_rpm=None):
+def _run_exact(link, t, q, cal_factor, speed_mult, max_rpm=None, manage_sensor_collection=True, analyze_after=True, auto_tare=True):
     """Stream the source curve point by point to the pump, with simultaneous sensor collection."""
     if max_rpm is None:
         max_rpm = PUMP_MAX_RPM
@@ -1076,9 +2012,18 @@ def _run_exact(link, t, q, cal_factor, speed_mult, max_rpm=None):
             "If no data is recorded after the run, disconnect and reconnect the sensor."
         )
 
-    # Start sensor collection — always call stop in finally regardless of is_open()
-    # to handle BLE drops mid-run (is_open() may become False but _collecting stays True)
-    sensor.start_collecting()
+    if auto_tare:
+        # Auto-tare before every run so the mass baseline starts at zero.
+        tare_val = sensor.tare()
+        status.info(f"Tared sensor (baseline {tare_val:.1f} g). Starting run...")
+        time.sleep(0.3)
+    else:
+        status.info("Starting run with existing sensor tare/recording state...")
+
+    if manage_sensor_collection:
+        # Start sensor collection — always call stop in finally regardless of is_open()
+        # to handle BLE drops mid-run (is_open() may become False but _collecting stays True)
+        sensor.start_collecting()
 
     start = time.time()
 
@@ -1110,7 +2055,8 @@ def _run_exact(link, t, q, cal_factor, speed_mult, max_rpm=None):
     finally:
         if link.is_open():
             link.hard_stop("exact playback complete")
-        sensor.stop_collecting()  # Always stop — guards against BLE drop leaving _collecting=True
+        if manage_sensor_collection:
+            sensor.stop_collecting()  # Always stop — guards against BLE drop leaving _collecting=True
         progress.empty()
 
     status.success(f"Playback complete ({playback_duration:.1f}s wall time)")
@@ -1124,7 +2070,8 @@ def _run_exact(link, t, q, cal_factor, speed_mult, max_rpm=None):
 
         df = pd.DataFrame({"time_s": cmd_t, "flow_ml_s": cmd_q, "rpm": cmd_rpm})
         csv = df.to_csv(index=False).encode()
-        st.download_button("Download log CSV", csv, file_name=f"playback_{int(time.time())}.csv")
+        _ts = int(time.time())
+        st.download_button("Download log CSV", csv, file_name=f"playback_{_ts}.csv", key=f"dl_log_csv_{_ts}")
 
     # Display pump TX/RX log
     if link.is_open():
@@ -1133,12 +2080,14 @@ def _run_exact(link, t, q, cal_factor, speed_mult, max_rpm=None):
             if log_text:
                 st.code(log_text, language="text")
                 log_bytes = log_text.encode()
-                st.download_button("Download pump log", log_bytes, file_name=f"pump_log_{int(time.time())}.txt", key="pump_log_exact")
+                _ts2 = int(time.time())
+                st.download_button("Download pump log", log_bytes, file_name=f"pump_log_{_ts2}.txt", key=f"pump_log_exact_{_ts2}")
             else:
                 st.info("No pump log available")
 
     # Analyze collected sensor data
-    _display_sensor_analysis()
+    if analyze_after:
+        _display_sensor_analysis()
 
 
 def _run_template(link, shape, qmax, volume, duration):
@@ -1157,6 +2106,10 @@ def _run_template(link, shape, qmax, volume, duration):
     link.send(f"qmax {qmax}")
     link.send(f"volume {volume}")
     link.send(f"duration {duration}")
+
+    # Auto-tare before every run so the mass baseline starts at zero.
+    sensor.tare()
+    time.sleep(0.3)
 
     # Start sensor collection before pump run — stop unconditionally in finally
     sensor.start_collecting()
@@ -1381,6 +2334,45 @@ def _build_run_analysis_figures(results):
     ]
 
 
+def _build_results_csv(results):
+    t = np.asarray(results["t_arr"], dtype=float)
+    n = len(t)
+    def _pad(arr): return np.asarray(arr, dtype=float)[:n] if len(arr) >= n else np.pad(np.asarray(arr, dtype=float), (0, n - len(arr)))
+    cum_g = _pad(results.get("cum_volume", []))
+    # Build zone column
+    empty_zones = results.get("empty", [])
+    voiding_zones = results.get("voiding", [])
+    draining_zones = results.get("draining", [])
+    roi = results.get("roi", [0, max(0, len(t) - 1)])
+    zone_col = np.full(len(t), "unknown", dtype=object)
+    for seg in empty_zones:
+        zone_col[seg[0]:seg[1]] = "empty"
+    for seg in draining_zones:
+        zone_col[seg[0]:seg[1]] = "draining"
+    for seg in voiding_zones:
+        zone_col[seg[0]:seg[1]] = "voiding"
+    is_roi = np.zeros(len(t), dtype=int)
+    is_roi[roi[0]:roi[1] + 1] = 1
+    df = pd.DataFrame({
+        "time_s":           t,
+        "mass_g":           _pad(results.get("raw_mass", [])),   # matches page_results reader
+        "filt_mass_g":      _pad(results.get("filt_mass", [])),
+        "filt_inflow_g_s":  _pad(results.get("filt_inflow", [])),
+        "kz_flow_g_s":      _pad(results.get("kz_flow", [])),
+        "cum_volume_g":     cum_g,
+        "cum_volume_mL":    cum_g / 0.9982,
+        "zone":             zone_col,
+        "is_roi":           is_roi,
+    })
+    # Scalar metadata as a comment row at the top
+    meta = (
+        f"# expected_volume_mL={results.get('expected_volume_mL', 0.0):.2f},"
+        f"sensor_cal_factor={results.get('sensor_cal_factor_used', 0.0):.8f},"
+        f"source_duration_s={results.get('source_duration', 0.0):.2f}\n"
+    )
+    return (meta + df.to_csv(index=False)).encode()
+
+
 def _build_run_analysis_pdf(results):
     figures = [("Overview", _build_overlay_figure(results))] + _build_run_analysis_figures(results)
     images = []
@@ -1463,61 +2455,65 @@ def _render_saved_run_analysis(results):
                     st.rerun()
 
     saved_at = int(results.get("saved_at", 0))
-    if st.session_state.get("last_run_pdf_for") != saved_at:
-        st.session_state["last_run_pdf"] = None
-        st.session_state["last_run_pdf_for"] = saved_at
 
-    pdf_bytes = st.session_state.get("last_run_pdf")
-    if pdf_bytes is not None:
-        # PDF was auto-generated — offer immediate download + JS auto-trigger
-        dl_col, regen_col = st.columns([2, 1])
-        with dl_col:
-            st.download_button(
-                "Download graphs as PDF",
-                data=pdf_bytes,
-                file_name=f"autoflow_graphs_{saved_at}.pdf",
-                mime="application/pdf",
-                key=f"download_pdf_{saved_at}",
-                type="primary",
-                use_container_width=True,
-            )
-        with regen_col:
-            if st.button("Regenerate PDF", key=f"regen_pdf_{saved_at}", use_container_width=True):
-                try:
-                    with st.spinner("Rendering PDF..."):
-                        st.session_state["last_run_pdf"] = _build_run_analysis_pdf(results)
-                        st.session_state["last_run_pdf_for"] = saved_at
-                    st.rerun()
-                except Exception as e:
-                    st.warning(f"PDF export failed: {e}")
+    # ── CSV download (instant) ──────────────────────────────────────────
+    csv_bytes = st.session_state.get("last_run_csv")
+    if st.session_state.get("last_run_csv_for") != saved_at or csv_bytes is None:
+        csv_bytes = _build_results_csv(results)
+        st.session_state["last_run_csv"] = csv_bytes
+        st.session_state["last_run_csv_for"] = saved_at
 
-        # Auto-trigger download in browser on first appearance
-        if st.session_state.get("auto_download_pdf"):
-            pdf_b64 = base64.b64encode(pdf_bytes).decode()
-            fname = f"autoflow_graphs_{saved_at}.pdf"
-            st.components.v1.html(
-                f"""<script>
-                (function(){{
-                    var a = document.createElement('a');
-                    a.href = 'data:application/pdf;base64,{pdf_b64}';
-                    a.download = '{fname}';
-                    document.body.appendChild(a);
-                    a.click();
-                    document.body.removeChild(a);
-                }})();
-                </script>""",
-                height=0,
-            )
-            st.session_state["auto_download_pdf"] = False
-    else:
-        if st.button("Prepare PDF", key=f"prepare_pdf_{saved_at}"):
+    dl_col, pdf_col = st.columns([2, 1])
+    with dl_col:
+        st.download_button(
+            "Download results CSV",
+            data=csv_bytes,
+            file_name=f"autoflow_results_{saved_at}.csv",
+            mime="text/csv",
+            key=f"download_csv_{saved_at}",
+            type="primary",
+            use_container_width=True,
+        )
+    with pdf_col:
+        if st.button("Export PDF", key=f"prepare_pdf_{saved_at}", use_container_width=True):
             try:
                 with st.spinner("Rendering PDF from graphs..."):
-                    st.session_state["last_run_pdf"] = _build_run_analysis_pdf(results)
+                    pdf_bytes = _build_run_analysis_pdf(results)
+                    st.session_state["last_run_pdf"] = pdf_bytes
                     st.session_state["last_run_pdf_for"] = saved_at
                 st.rerun()
             except Exception as e:
-                st.warning(f"PDF export unavailable right now: {e}")
+                st.warning(f"PDF export unavailable: {e}")
+
+    pdf_bytes = st.session_state.get("last_run_pdf")
+    if pdf_bytes is not None and st.session_state.get("last_run_pdf_for") == saved_at:
+        st.download_button(
+            "Download PDF",
+            data=pdf_bytes,
+            file_name=f"autoflow_graphs_{saved_at}.pdf",
+            mime="application/pdf",
+            key=f"download_pdf_{saved_at}",
+            use_container_width=True,
+        )
+
+    # Auto-trigger CSV download in browser when queue auto-downloads
+    if st.session_state.get("auto_download_csv"):
+        csv_b64 = base64.b64encode(csv_bytes).decode()
+        fname = f"autoflow_results_{saved_at}.csv"
+        st.components.v1.html(
+            f"""<script>
+            (function(){{
+                var a = document.createElement('a');
+                a.href = 'data:text/csv;base64,{csv_b64}';
+                a.download = '{fname}';
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+            }})();
+            </script>""",
+            height=0,
+        )
+        st.session_state["auto_download_csv"] = False
 
     # ── primary overlay chart (Flutter-style: all traces on one plot) ──
     st.plotly_chart(_build_overlay_figure(results), use_container_width=True)
@@ -1562,6 +2558,14 @@ def _display_sensor_analysis():
 
     if not t_data or len(t_data) < 3:
         st.session_state["run_analysis_status"] = "No sensor analysis available"
+        pending_name = st.session_state.get("pending_multi_fit_run_name")
+        if pending_name:
+            st.session_state["last_multi_fit_capture_result"] = {
+                "name": pending_name,
+                "ok": False,
+                "payload": "No usable sensor data captured.",
+            }
+            st.session_state["pending_multi_fit_run_name"] = None
         age = sensor.last_packet_age
         age_str = f"{age:.1f}s ago" if age is not None else "never"
         st.error(
@@ -1580,7 +2584,7 @@ def _display_sensor_analysis():
     m_arr = np.asarray(m_data, dtype=float)
     filt_mass, filt_inflow, kz_flow, cum_volume, empty, voiding, draining, roi = compute_flow_from_mass(t_arr, m_arr, cal_map)
 
-    saved_at = time.time()
+    saved_at = int(time.time())
     analysis = {
         "t_arr": t_arr.tolist(),
         "raw_mass": m_arr.tolist(),
@@ -1601,20 +2605,27 @@ def _display_sensor_analysis():
     st.session_state["last_run_analysis"] = analysis
     st.session_state["run_analysis_status"] = "Graphs ready"
 
-    # Auto-generate PDF so it's ready for immediate download
-    try:
-        with st.spinner("Generating PDF report..."):
-            pdf_bytes = _build_run_analysis_pdf(analysis)
-        if pdf_bytes:
-            st.session_state["last_run_pdf"] = pdf_bytes
-            st.session_state["last_run_pdf_for"] = saved_at
-            st.session_state["auto_download_pdf"] = True
-        else:
-            st.session_state["last_run_pdf"] = None
-            st.session_state["last_run_pdf_for"] = None
-    except Exception:
-        st.session_state["last_run_pdf"] = None
-        st.session_state["last_run_pdf_for"] = None
+    # Build CSV immediately (instant) and store for auto-download
+    st.session_state["last_run_csv"] = _build_results_csv(analysis)
+    st.session_state["last_run_csv_for"] = saved_at
+    st.session_state["auto_download_csv"] = True
+
+    pending_name = st.session_state.get("pending_multi_fit_run_name")
+    if pending_name:
+        ok, payload = _append_multi_cal_run_from_csv_bytes(
+            pending_name,
+            st.session_state["last_run_csv"],
+        )
+        st.session_state["last_multi_fit_capture_result"] = {
+            "name": pending_name,
+            "ok": ok,
+            "payload": payload,
+        }
+        st.session_state["pending_multi_fit_run_name"] = None
+
+    # Clear any stale PDF state
+    st.session_state["last_run_pdf"] = None
+    st.session_state["last_run_pdf_for"] = None
 
     return
 

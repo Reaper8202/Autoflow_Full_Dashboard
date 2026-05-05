@@ -720,7 +720,7 @@ class SensorLink:
             if dt < 0 or dt > 5.0:
                 print(f"Dropping suspicious BLE sample with dt={dt:.3f}s raw_time_s={raw_time_s}")
                 return
-        calibrated_mass = raw_value * self.calibration_factor
+        calibrated_mass = -raw_value * self.calibration_factor
         if not (-1000.0 <= calibrated_mass <= 5000.0):
             print(f"Dropping suspicious BLE sample raw={raw_value} calibrated={calibrated_mass}")
             return
@@ -734,7 +734,7 @@ class SensorLink:
         # Written outside the lock; Python GIL makes the assignment atomic.
         self._last_packet_wall_time = time.time()
 
-        calibrated_mass = raw_value * self.calibration_factor
+        calibrated_mass = -raw_value * self.calibration_factor
         tare_adjusted_mass = calibrated_mass - self.tare_offset
 
         with self._lock:
