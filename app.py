@@ -1357,7 +1357,6 @@ def page_results():
         csvs = _find_autoflow_csvs()
         if not csvs:
             st.info("No AutoFlow CSVs found. Use the Upload tab or export from the Flutter app.")
-            return
 
         names = [f"{f.name}  ({f.parent.name}/)" for f in csvs]
         idx = st.selectbox("Select a result file", range(len(names)), format_func=lambda i: names[i])
@@ -1558,15 +1557,50 @@ def _render_test_data(df, calib_df):
 
 def _render_generic_section(name, df):
     st.subheader(name)
-    # Try to auto-plot if there are numeric columns
-    num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-    if len(num_cols) >= 2:
-        fig = go.Figure()
-        x_col = num_cols[0]
-        for col in num_cols[1:]:
-            fig.add_trace(go.Scatter(x=df[x_col], y=df[col], name=col, mode="lines"))
-        fig.update_layout(xaxis_title=x_col, height=350)
-        st.plotly_chart(fig, use_container_width=True)
+
+    required = ["time_s", "mass_g", "filt_mass_g", "filt_inflow_g_s", "kz_flow_g_s", "cum_volume_mL"]
+
+    if all(col in df.columns for col in required):
+        t = df["time_s"]
+
+        cols = st.columns(4)
+        cols[0].metric("Duration", f"{t.iloc[-1] - t.iloc[0]:.1f} s")
+        cols[1].metric("Peak Flow", f"{df['kz_flow_g_s'].max():.2f} g/s")
+        cols[2].metric("Volume", f"{df['cum_volume_mL'].iloc[-1]:.1f} mL")
+        cols[3].metric("Max Mass", f"{df['filt_mass_g'].max():.1f} g")
+
+        fig1 = go.Figure()
+        fig1.add_trace(go.Scatter(x=t, y=df["mass_g"], name="Raw Mass", mode="lines"))
+        fig1.add_trace(go.Scatter(x=t, y=df["filt_mass_g"], name="Filtered Mass", mode="lines"))
+        fig1.update_layout(title="Mass vs Time", xaxis_title="Time (s)", yaxis_title="Mass (g)", height=400)
+        st.plotly_chart(fig1, use_container_width=True)
+
+        fig2 = go.Figure()
+        fig2.add_trace(go.Scatter(x=t, y=df["filt_inflow_g_s"], name="Filtered Inflow", mode="lines"))
+        fig2.add_trace(go.Scatter(x=t, y=df["kz_flow_g_s"], name="KZ Flow", mode="lines"))
+        fig2.update_layout(title="Flow Rate vs Time", xaxis_title="Time (s)", yaxis_title="Flow (g/s)", height=400)
+        st.plotly_chart(fig2, use_container_width=True)
+
+        fig3 = go.Figure()
+        fig3.add_trace(go.Scatter(x=t, y=df["cum_volume_mL"], name="Cumulative Volume", mode="lines"))
+        fig3.update_layout(title="Cumulative Volume", xaxis_title="Time (s)", yaxis_title="Volume (mL)", height=350)
+        st.plotly_chart(fig3, use_container_width=True)
+
+        fig4 = go.Figure()
+        fig4.add_trace(go.Scatter(x=df["filt_mass_g"], y=df["kz_flow_g_s"], name="Flow vs Mass", mode="lines"))
+        fig4.update_layout(title="Flow Rate vs Mass", xaxis_title="Mass (g)", yaxis_title="Flow (g/s)", height=350)
+        st.plotly_chart(fig4, use_container_width=True)
+
+    else:
+        num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+        if len(num_cols) >= 2:
+            fig = go.Figure()
+            x_col = num_cols[0]
+            for col in num_cols[1:]:
+                fig.add_trace(go.Scatter(x=df[x_col], y=df[col], name=col, mode="lines"))
+            fig.update_layout(xaxis_title=x_col, height=350)
+            st.plotly_chart(fig, use_container_width=True)
+
     with st.expander("Data table"):
         st.dataframe(df, use_container_width=True)
 
