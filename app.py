@@ -1148,16 +1148,14 @@ def _fit_estimated_calibration_map_from_recording(expected_volume_ml, reference_
 
 
 def _expected_volume_from_csv_text(text):
+    import re
+
     first_line = text.splitlines()[0].strip() if text.splitlines() else ""
-    if not first_line.startswith("#"):
-        return 0.0
-    for part in first_line[1:].split(","):
-        part = part.strip()
-        if part.startswith("expected_volume_mL="):
-            try:
-                return float(part.split("=", 1)[1])
-            except ValueError:
-                return 0.0
+
+    match = re.search(r"expected_volume_mL\s*=\s*([0-9.]+)", first_line)
+    if match:
+        return float(match.group(1))
+
     return 0.0
 
 
@@ -1368,20 +1366,26 @@ def page_results():
     with tab_upload:
         uploaded = st.file_uploader("Upload a CSV", type=["csv"])
         if uploaded:
-            # Try AutoFlow combined format first, fall back to 2-column
-            sections = _parse_autoflow_csv(uploaded)
-            if sections:
-                st.session_state["result_sections"] = sections
-                st.session_state["result_name"] = uploaded.name
-            else:
-                # Try as simple 2-column CSV (time, flow) or multi-column
+            try:
                 uploaded.seek(0)
-                try:
-                    df = pd.read_csv(uploaded)
+                csv_text = uploaded.read().decode(errors="replace")
+
+                expected_ml = _expected_volume_from_csv_text(csv_text)
+
+                sections = _parse_autoflow_csv(io.BytesIO(csv_text.encode()))
+
+                # Only use section parser for real multi-section exports
+                if sections and len(sections) > 1:
+                    st.session_state["result_sections"] = sections
+                else:
+                    df = pd.read_csv(io.StringIO(csv_text), comment="#")
+                    df.attrs["expected_volume_mL"] = expected_ml
                     st.session_state["result_sections"] = {"Uploaded Data": df}
-                    st.session_state["result_name"] = uploaded.name
-                except Exception as e:
-                    st.error(f"Could not parse CSV: {e}")
+
+                st.session_state["result_name"] = uploaded.name
+
+            except Exception as e:
+                st.error(f"Could not parse CSV: {e}")
 
     # ── render loaded results ──────────────────────────────────────────
     sections = st.session_state.get("result_sections")
@@ -1563,11 +1567,42 @@ def _render_generic_section(name, df):
     if all(col in df.columns for col in required):
         t = df["time_s"]
 
-        cols = st.columns(4)
-        cols[0].metric("Duration", f"{t.iloc[-1] - t.iloc[0]:.1f} s")
-        cols[1].metric("Peak Flow", f"{df['kz_flow_g_s'].max():.2f} g/s")
-        cols[2].metric("Volume", f"{df['cum_volume_mL'].iloc[-1]:.1f} mL")
-        cols[3].metric("Max Mass", f"{df['filt_mass_g'].max():.1f} g")
+        measured_ml = float(df["cum_volume_mL"].iloc[-1])
+
+        expected_ml = float(df.attrs.get("expected_volume_mL", 0.0))
+
+        if expected_ml > 0:
+            error_pct = (expected_ml - measured_ml) / expected_ml * 100
+            error_text = f"{error_pct:+.1f}%"
+        else:
+            error_text = "—"
+
+        cols = st.columns(5)
+
+        cols[0].metric(
+            "Duration",
+            f"{t.iloc[-1] - t.iloc[0]:.1f} s"
+        )
+
+        cols[1].metric(
+            "Peak Flow",
+            f"{df['kz_flow_g_s'].max():.2f} g/s"
+        )
+
+        cols[2].metric(
+            "Volume",
+            f"{measured_ml:.1f} mL"
+        )
+
+        cols[3].metric(
+            "Expected",
+            f"{expected_ml:.1f} mL" if expected_ml > 0 else "—"
+        )
+
+        cols[4].metric(
+            "Error",
+            error_text
+        )
 
         fig1 = go.Figure()
         fig1.add_trace(go.Scatter(x=t, y=df["mass_g"], name="Raw Mass", mode="lines"))
@@ -1618,7 +1653,7 @@ def _find_col(df, candidates):
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  PAGE 2 — RUN TEST
+#  PAGE 3 — RUN TEST
 # ══════════════════════════════════════════════════════════════════════════
 
 # INSERT _wait_for_drain FUNCTION HERE: used by the run queue between tests.
@@ -2030,9 +2065,10 @@ def _run_exact(link, t, q, cal_factor, speed_mult, max_rpm=None, manage_sensor_c
 
     duration = float(t[-1])
     playback_duration = duration / max(speed_mult, 1e-6)
-    control_dt = min(0.05, max(0.01, playback_duration / 1000.0))
+    control_dt = min(0.05, max(0.01, playback_duration / 1000.0)) # on a 25s playback it would be 25ms
 
     cmd_t, cmd_q, cmd_rpm = [], [], []
+    timing_rows = [] #added for debugging
     last_rpm = None
     link.drain()
 
@@ -2059,20 +2095,43 @@ def _run_exact(link, t, q, cal_factor, speed_mult, max_rpm=None, manage_sensor_c
         # to handle BLE drops mid-run (is_open() may become False but _collecting stays True)
         sensor.start_collecting()
 
-    start = time.time()
+    start = time.perf_counter() #changed from time.time to time.perf_counter for better precision in timing the control loop
 
+    # Main control loop: command is sent at fixed intervals (control_dt) not at the interval from the source data.
+    # RPM is calculated by interpolating the source curve at the elapsed time instead of the raw value at the time in the CSV file. 
+    # Potential reason for error if the rpm doesn't change unless it is above the threshold. But still wouldn't be off by that much
+    # Added logging for timing of each loop. Comment out when not needed.
     try:
         while True:
-            elapsed = time.time() - start
+            loop_start = time.perf_counter()
+            elapsed = loop_start - start
             src_elapsed = min(duration, elapsed * speed_mult)
-            flow = float(np.interp(src_elapsed, t, q))
+            flow = float(np.interp(src_elapsed, t, q)) # potential source of error? it isn't taking the exact values from the CSV (but not by so much)
             rpm = max(0.0, min(max_rpm, flow / cal_factor))
             if rpm < MIN_RPM_THRESHOLD:
                 rpm = 0.0
 
+            # debugging
+            wrote_command = False
+            command_text = ""
+            write_duration_s = 0.0
+            drain_duration_s = 0.0
+
             if last_rpm is None or abs(rpm - last_rpm) >= RPM_WRITE_EPSILON:
+                command_text = "0" if rpm <= 0 else f"rpm {rpm:.3f}"
+                wrote_command = True
+
+                write_start = time.perf_counter()
                 link.write_line("0" if rpm <= 0 else f"{rpm:.3f}")
+                write_end = time.perf_counter()
+
+                drain_start = time.perf_counter()
                 link.drain()
+                drain_end = time.perf_counter()
+
+                write_duration_s = write_end - write_start
+                drain_duration_s = drain_end - drain_start
+                wrote_command = True
                 last_rpm = rpm
 
             cmd_t.append(src_elapsed)
@@ -2082,6 +2141,21 @@ def _run_exact(link, t, q, cal_factor, speed_mult, max_rpm=None, manage_sensor_c
             frac = min(1.0, src_elapsed / max(duration, 1e-6))
             samp = sensor.sample_count
             progress.progress(frac, text=f"{src_elapsed:.1f}/{duration:.1f}s  flow={flow:.2f} mL/s  rpm={rpm:.0f}  samp={samp}")
+
+            loop_end = time.perf_counter() # debugging
+            timing_rows.append({
+                "wall_time_s": elapsed,
+                "src_time_s": src_elapsed,
+                "flow": flow,
+                "rpm": rpm,
+                "wrote_command": wrote_command,
+                "command_text": command_text,
+                "write_duration_s": write_duration_s,
+                "drain_duration_s": drain_duration_s,
+                "loop_duration_s": loop_end - loop_start,
+                "control_dt_s": control_dt,
+                "sensor_samples": samp,
+            })
 
             if src_elapsed >= duration:
                 break
@@ -2107,6 +2181,30 @@ def _run_exact(link, t, q, cal_factor, speed_mult, max_rpm=None, manage_sensor_c
         _ts = int(time.time())
         st.download_button("Download log CSV", csv, file_name=f"playback_{_ts}.csv", key=f"dl_log_csv_{_ts}")
 
+        # debugging, show timing
+    if timing_rows:
+        timing_df = pd.DataFrame(timing_rows)
+        timing_csv = timing_df.to_csv(index=False).encode()
+        _ts_timing = int(time.time())
+
+        st.download_button(
+            "Download timing test CSV",
+            timing_csv,
+            file_name=f"pump_timing_test_{_ts_timing}.csv",
+            key=f"dl_timing_csv_{_ts_timing}",
+        )
+
+        st.write("Timing summary:")
+        st.dataframe(
+            timing_df[[
+                "loop_duration_s",
+                "sleep_duration_s",
+                "write_duration_s",
+                "drain_duration_s",
+                "wrote_command",
+                "rpm"
+            ]].describe()
+        )
     # Display pump TX/RX log
     if link.is_open():
         with st.expander("Show pump TX/RX log"):
