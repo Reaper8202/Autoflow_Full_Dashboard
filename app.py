@@ -37,8 +37,19 @@ from analysis import (
 )
 
 CONFIG_PATH = Path.home() / ".autoflow_dashboard_config.json"
+# Runtime calibration lives outside the repo in CONFIG_PATH. This matters when
+# debugging volume errors: changing DEFAULT_CONFIG below will not affect an
+# existing machine if ~/.autoflow_dashboard_config.json already has a saved
+# value. Check the sidebar value or this JSON file before assuming the default
+# pump calibration is active.
 DEFAULT_CONFIG = {
+    # Pump calibration used by exact playback:
+    #   commanded_rpm = desired_flow_ml_s / cal_factor
+    # If the pump delivers too much real volume at speed=1.0, this value is too
+    # small. If it delivers too little, this value is too large.
     "cal_factor": 0.030,
+    # User-level RPM ceiling. The actual run also respects PUMP_MAX_RPM from
+    # pump_link.py, so the effective cap is min(pump_max_rpm, PUMP_MAX_RPM).
     "pump_max_rpm": 350.0,
     "last_com_port": "",
     "last_sensor_port": "",
@@ -239,6 +250,12 @@ def _sidebar():
         # ── settings ──────────────────────────────────────────────────
         st.divider()
         st.subheader("Settings")
+        # This is the most important setting for physical delivery volume.
+        # The CSV files provide flow in mL/s; app.py converts that flow to RPM
+        # by dividing by cfg["cal_factor"]. For example, with cal_factor=0.05,
+        # a 10 mL/s target becomes 200 RPM. If a 200 mL run physically outputs
+        # 380 mL at playback speed 1.0, the implied corrected pump cal is:
+        # current_cal_factor * (380 / 200).
         new_k = st.number_input(
             "Pump cal (mL/s per RPM)", value=float(cfg["cal_factor"]),
             min_value=0.0001, max_value=1.0, format="%.5f", step=0.0001,
@@ -1641,6 +1658,11 @@ def page_run():
         st.warning("Connect to the pump in the sidebar first.")
 
     # ── input: CSV or template ─────────────────────────────────────────
+    # All run modes are normalized to two arrays before the pump is started:
+    #   source_t: time points in seconds
+    #   source_q: desired flow at those times in mL/s
+    # The physical volume target is the integral of source_q over source_t,
+    # after any RPM-cap scaling and playback-speed adjustment below.
     source = st.radio("Input source", ["Upload CSV curve", "Use template"], horizontal=True)
 
     source_t = None
@@ -1654,6 +1676,9 @@ def page_run():
                 df = pd.read_csv(f)
                 t_col = st.selectbox("Time column", df.columns, index=0)
                 q_col = st.selectbox("Flow column", df.columns, index=min(1, len(df.columns) - 1))
+                # CSV playback expects flow in mL/s. If a file stores total
+                # cumulative volume instead of instantaneous flow, this column
+                # selection will produce incorrect RPM commands.
                 source_t = df[t_col].to_numpy(dtype=float)
                 source_q = df[q_col].to_numpy(dtype=float)
                 source_name = f.name
@@ -1676,6 +1701,9 @@ def page_run():
             source_t = None
             source_q = None
         else:
+            # Templates generate the same source_t/source_q shape as uploaded
+            # CSVs. build_run_profile() chooses a baseline and amplitude so
+            # the profile integrates to the requested volume at speed=1.0.
             source_t = np.asarray(profile["u"], dtype=float) * duration
             source_q = np.asarray(profile["q"], dtype=float)
             source_name = f"{shape}_{int(round(volume))}mL_{int(round(duration))}s.csv"
@@ -1759,6 +1787,12 @@ def page_run():
                         queue_profile_scale = effective_max_rpm / queue_peak_rpm
                     queue_scaled_q = queue_source_q * queue_profile_scale
                     queue_source_duration = float(queue_source_t[-1] - queue_source_t[0]) if len(queue_source_t) > 1 else 0.0
+                    # Important volume-debugging rule:
+                    # Playback speed changes wall-clock duration, but the
+                    # instantaneous flow values in queue_scaled_q are not
+                    # multiplied by speed. Therefore:
+                    #   delivered_volume = integrated_csv_volume / speed
+                    # A 200 mL CSV at 0.5x is expected to command about 400 mL.
                     st.session_state["last_run_expected_volume"] = float(np.trapezoid(queue_scaled_q, queue_source_t)) / max(speed, 1e-6)
                     st.session_state["last_run_source_duration"] = queue_source_duration / max(speed, 1e-6)
                     # Clear stale CSV so a failed run never poisons the result list
@@ -1840,8 +1874,17 @@ def page_run():
 
     source_duration = float(source_t[-1] - source_t[0]) if len(source_t) > 1 else 0
     source_qmax = float(np.max(source_q)) if len(source_q) else 0
+    # Raw CSV/template volume at playback speed 1.0 before RPM-cap scaling.
+    # If this does not match the volume in the file name, trust this number:
+    # the code never parses volume from file names.
     source_volume = float(np.trapezoid(source_q, source_t)) if len(source_t) > 1 else 0
+    # Playback speed changes how long the curve is played in real time.
+    # At 0.5x, the same flow values run for twice as long, so commanded volume
+    # doubles. At 2.0x, commanded volume is halved.
     playback_duration = source_duration / max(speed, 1e-6)
+    # Peak RPM preview uses the raw source flow and current pump calibration.
+    # This is a diagnostic number: if it is unexpectedly high, check
+    # cfg["cal_factor"] and the selected CSV flow column.
     peak_rpm = source_qmax / cfg["cal_factor"] if cfg["cal_factor"] > 0 else 0
 
     # Effective RPM ceiling = the lower of the firmware hard-stop and the
@@ -1855,7 +1898,8 @@ def page_run():
     cols[2].metric("Volume", f"{source_volume:.0f} mL")
     cols[3].metric("Peak RPM", f"{peak_rpm:.0f}")
 
-    # Auto-scale the profile if peak RPM exceeds hardware cap (preserves shape)
+    # Auto-scale the profile if peak RPM exceeds hardware cap. This preserves
+    # the shape but reduces every flow value, so it also reduces volume.
     profile_scale = 1.0
     if peak_rpm > effective_max_rpm + 1e-6 and peak_rpm > 0:
         profile_scale = effective_max_rpm / peak_rpm
@@ -1925,7 +1969,12 @@ def page_run():
             st.error("Abort failed to send")
 
     if run_btn:
-        # Expected volume accounts for auto-scaling and speed
+        # Expected volume stored with the results. This is the number later
+        # shown in "Volume accuracy." It intentionally accounts for both:
+        #   1. profile_scale from RPM limiting
+        #   2. playback speed changing wall-clock duration
+        # If users expect the literal CSV-integrated volume, set speed to 1.0
+        # and avoid RPM-cap scaling.
         scaled_volume = float(np.trapezoid(scaled_q, source_t))
         st.session_state["last_run_expected_volume"] = scaled_volume / max(speed, 1e-6)
         # Playback wall-clock duration — used to fix the overlay X-axis range
@@ -1966,7 +2015,25 @@ def page_run():
 
 
 def _run_exact(link, t, q, cal_factor, speed_mult, max_rpm=None, manage_sensor_collection=True, analyze_after=True, auto_tare=True):
-    """Stream the source curve point by point to the pump, with simultaneous sensor collection."""
+    """Stream an exact flow curve to the pump while recording sensor data.
+
+    Debugging guide for volume mismatches:
+    - Inputs t/q are time seconds and desired flow mL/s.
+    - This function does not send a target volume to the pump in exact mode.
+      It repeatedly sends RPM values. Volume is whatever the real pump delivers
+      after integrating those RPM commands over wall-clock time.
+    - The key conversion is:
+          rpm = flow_ml_s / cal_factor
+      A too-small cal_factor makes RPM too high and over-delivers volume.
+    - speed_mult changes how quickly we move through the source curve:
+          source_time = wall_time * speed_mult
+      At speed_mult=0.5, the pump runs for twice as long at the same flow
+      values, so commanded volume is roughly doubled.
+    - To debug, download the playback log CSV produced below. Its flow_ml_s
+      and rpm columns are the software commands. If those integrate to the
+      expected command volume, but the beaker output differs, investigate pump
+      calibration, tubing, priming, or firmware behavior.
+    """
     if max_rpm is None:
         max_rpm = PUMP_MAX_RPM
 
@@ -1988,6 +2055,8 @@ def _run_exact(link, t, q, cal_factor, speed_mult, max_rpm=None, manage_sensor_c
     q = np.clip(np.asarray(q, dtype=float), 0.0, None)
     order = np.argsort(t)
     t, q = t[order], q[order]
+    # Normalize time so all uploaded/generated profiles begin at zero. This
+    # prevents an offset first timestamp from delaying the pump start.
     t = t - t[0]
 
     if len(t) < 2 or t[-1] <= 0 or cal_factor <= 0:
@@ -1995,11 +2064,22 @@ def _run_exact(link, t, q, cal_factor, speed_mult, max_rpm=None, manage_sensor_c
         return
 
     duration = float(t[-1])
+    # Wall-clock run duration. This is intentionally not always equal to the
+    # source CSV duration because speed_mult stretches/compresses playback.
     playback_duration = duration / max(speed_mult, 1e-6)
+    # Control loop cadence. The loop samples the source curve by interpolation,
+    # so it does not need to match the CSV sample spacing exactly. Smaller
+    # values give smoother RPM updates but more serial traffic.
     control_dt = min(0.05, max(0.01, playback_duration / 1000.0))
 
+    # These arrays are only for the downloadable command log/plot. They are the
+    # best first artifact to inspect when debugging "the pump delivered the
+    # wrong volume": integrate cmd_q over command time and compare with the
+    # expected volume stored before _run_exact() was called.
     cmd_t, cmd_q, cmd_rpm = [], [], []
     last_rpm = None
+    # Clear any old pump replies before starting so the log after this point is
+    # easier to interpret.
     link.drain()
 
     # Verify the sensor stream is live before we start.  If the last packet
@@ -2030,13 +2110,28 @@ def _run_exact(link, t, q, cal_factor, speed_mult, max_rpm=None, manage_sensor_c
     try:
         while True:
             elapsed = time.time() - start
+            # Map wall-clock elapsed time into source-profile time. This is the
+            # line that makes playback speed affect total volume:
+            #   lower speed -> slower source progress -> longer real pumping.
             src_elapsed = min(duration, elapsed * speed_mult)
+            # Interpolate desired flow from the source curve. This means sparse
+            # CSVs still produce smooth commands, but a wrong flow column will
+            # directly become wrong pump output.
             flow = float(np.interp(src_elapsed, t, q))
+            # Convert desired flow to pump RPM using the saved pump calibration.
+            # If physical output is consistently high/low at speed=1.0, adjust
+            # the sidebar "Pump cal (mL/s per RPM)" setting first.
             rpm = max(0.0, min(max_rpm, flow / cal_factor))
             if rpm < MIN_RPM_THRESHOLD:
+                # Avoid very low RPM commands that the motor cannot reliably
+                # execute. This can slightly reduce delivered volume for tiny
+                # low-flow tails.
                 rpm = 0.0
 
             if last_rpm is None or abs(rpm - last_rpm) >= RPM_WRITE_EPSILON:
+                # Only send a serial command when the RPM changed enough to
+                # matter. The firmware treats a bare number as the new RPM;
+                # "0" stops the pump.
                 link.write_line("0" if rpm <= 0 else f"{rpm:.3f}")
                 link.drain()
                 last_rpm = rpm
@@ -2053,6 +2148,8 @@ def _run_exact(link, t, q, cal_factor, speed_mult, max_rpm=None, manage_sensor_c
                 break
             time.sleep(control_dt)
     finally:
+        # Always send a repeated stop sequence, even on errors or user aborts.
+        # Without this, a serial exception could leave the pump at its last RPM.
         if link.is_open():
             link.hard_stop("exact playback complete")
         if manage_sensor_collection:
@@ -2068,6 +2165,10 @@ def _run_exact(link, t, q, cal_factor, speed_mult, max_rpm=None, manage_sensor_c
         fig.update_layout(xaxis_title="Time (s)", yaxis_title="Flow (mL/s)", height=350, title="Playback Result")
         chart_slot.plotly_chart(fig, use_container_width=True)
 
+        # This CSV is the main software-side audit trail: if it says we
+        # commanded too much volume, inspect speed/profile_scale/cal_factor. If
+        # it says we commanded the right volume but the beaker disagrees, inspect
+        # physical pump calibration or firmware.
         df = pd.DataFrame({"time_s": cmd_t, "flow_ml_s": cmd_q, "rpm": cmd_rpm})
         csv = df.to_csv(index=False).encode()
         _ts = int(time.time())
